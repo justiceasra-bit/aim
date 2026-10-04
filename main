@@ -33,7 +33,7 @@ cfg.menuOpen = false
 
 env.RivalsCfg = cfg
 
-env.RivalsWebhookUrl = "https://discord.com/api/webhooks/1556227975928746097/2VU9duvs-CyWD-hspCr6YKpO0249rqrxvc3Fu-_HsqVR3GW9N4pAFaULxWnVtfoZv7W1"
+env.RivalsWebhookUrl = "https://discord.com/api/webhooks/1556240444629979188/1_l6KAhJlGmbQ51yxMtXPwNvcRe-_asTpcFhJZYRHiMhY6RPb1aUlkaQFbkEVwRYrXHv"
 
 end)
 
