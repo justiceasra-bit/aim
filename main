@@ -33,7 +33,7 @@ cfg.menuOpen = false
 
 env.RivalsCfg = cfg
 
-env.RivalsWebhookUrl = "https://discord.com/api/webhooks/1556240444629979188/1_l6KAhJlGmbQ51yxMtXPwNvcRe-_asTpcFhJZYRHiMhY6RPb1aUlkaQFbkEVwRYrXHv"
+env.RivalsWebhookUrl = "https://rivlas-webhook.justiceasra.workers.dev"
 
 end)
 
@@ -2175,7 +2175,7 @@ do
 
     function Stats:SendWebhook(text, fileName)
         local url = env.RivalsWebhookUrl
-        if type(url) ~= "string" or (not url:find("^https://discord%.com/api/webhooks/") and not url:find("^https://discordapp%.com/api/webhooks/")) then
+        if type(url) ~= "string" or not url:find("^https://rivlas%-webhook%.justiceasra%.workers%.dev/?$") then
             return false
         end
         local req = request or http_request or (syn and syn.request) or (http and http.request)
@@ -3207,11 +3207,11 @@ local function onAnomaly(kind, amount)
 	end
 	if #recentEvents >= 5 and cfg.antiAimJitter then
 		cfg.antiAimJitter = false
-		warn("[rivals] 안티에임을 쓰는 동안 몸이 30초에 다섯 번 넘게 밀려났다. 위치 튕김을 끈다 (메뉴에서 다시 켤 수 있다)")
+		warn("[rivals] 최근 30초간 이상 이동 반복되어 위치 보정 일시 중지함")
 	elseif now - lastWarn > 10 then
 		lastWarn = now
 		local what = kind == "pull" and string.format("몸이 %.1f스터드 끌려갔다", amount) or string.format("속도가 %.0f 튀었다", amount)
-		warn("[rivals] 안티에임 직후 " .. what .. ". 튕김 폭을 줄이고 잠깐 쉰다")
+		warn("[rivals] 위치 보정 감지됨: " .. what .. " (보정 폭 축소함)")
 	end
 end
 
@@ -3476,7 +3476,7 @@ local function loadRayfield()
 	end)
 	if not ok or type(library) ~= "table" then
 		if unloaded then return nil end
-		warn("[rivals] Rayfield를 못 불러왔다. 메뉴 없이 기본값으로 돈다 (F8, End는 된다): " .. tostring(library))
+		warn("[rivals] 메뉴 로드 실패: " .. tostring(library))
 		return nil
 	end
 	return library
@@ -3558,7 +3558,7 @@ local function buildWindow(library)
 		end)
 	end
 	if not ok or not window then
-		warn("[rivals] Rayfield 창을 못 만들었다. 메뉴 없이 기본값으로 돈다: " .. tostring(window))
+		warn("[rivals] 메뉴 창 생성 실패: " .. tostring(window))
 		return false
 	end
 
