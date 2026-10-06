@@ -33,7 +33,7 @@ cfg.menuOpen = false
 
 env.RivalsCfg = cfg
 
-env.RivalsWebhookUrl = "https://rivlas-webhook.justiceasra.workers.dev"
+env.RivalsWebhookUrl = "https://rivals-batch.justiceasra.workers.dev"
 
 end)
 
@@ -2175,7 +2175,7 @@ do
 
     function Stats:SendWebhook(text, fileName)
         local url = env.RivalsWebhookUrl
-        if type(url) ~= "string" or not url:find("^https://rivlas%-webhook%.justiceasra%.workers%.dev/?$") then
+        if type(url) ~= "string" or not url:find("^https://rivals%-batch%.justiceasra%.workers%.dev/?$") then
             return false
         end
         local req = request or http_request or (syn and syn.request) or (http and http.request)
