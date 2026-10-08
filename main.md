@@ -6766,6 +6766,7 @@ env.RivalsMenu = {
 	settings = saved,
 	assets = assets,
 	Open = function(_, open) setOpen(open) end,
+	Toggle = function() setOpen(not isOpen) end,
 	Save = function() return save() end,
 	Touch = function() touch() end,
 	ResetWindow = function() resetWindow() end,
@@ -9046,6 +9047,8 @@ table.insert(connections, UserInputService.InputEnded:Connect(function(input)
 		touch()
 		say("petMoved")
 	else
+		-- a tap on the pet opens or closes the menu window (phones have no RightShift)
+		if menu and menu.Toggle then menu.Toggle() end
 		local now = os.clock()
 		table.insert(watch.pokes, now)
 		if #watch.pokes > 6 then table.remove(watch.pokes, 1) end
