@@ -1443,6 +1443,29 @@ do
         return filter
     end
 
+    local surfaceParams = RaycastParams.new()
+    surfaceParams.FilterType = Enum.RaycastFilterType.Include
+    surfaceParams.IgnoreWater = true
+    local PROBES = {
+        Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0), Vector3.new(0, 1, 0), Vector3.new(0, -1, 0), Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+    }
+    for x = -1, 1, 2 do
+        for y = -1, 1, 2 do
+            for z = -1, 1, 2 do
+                table.insert(PROBES, Vector3.new(x, y, z).Unit)
+            end
+        end
+    end
+
+    local function touchesSurface(position, parts, from)
+        surfaceParams.FilterDescendantsInstances = parts
+        if Workspace:Raycast(from, position - from, surfaceParams) then return true end
+        for _, direction in ipairs(PROBES) do
+            if Workspace:Raycast(position, direction * CLEARANCE, surfaceParams) then return true end
+        end
+        return false
+    end
+
     function DesyncController:Sight(from, to, head)
         sightParams.FilterDescendantsInstances = ownFilter()
         local result = Workspace:Raycast(from, to - from, sightParams)
@@ -1483,23 +1506,29 @@ do
         if cached and (cached.line or now - cached.at < 0.25) then
             local base = anchorFor(cached.list, targetRoot, head)
             local candidate = base and base * cached.offset
-            if candidate and self:IsSafe(candidate.Position, rootPart) and (not cached.line or self:HasLine(candidate.Position, head)) then
-                return candidate, cached.offset
+            if candidate then
+                local safe, exact = self:IsSafe(candidate.Position, rootPart)
+                if safe and (not cached.line or self:HasLine(candidate.Position, head)) then
+                    self.pickExact = exact == true
+                    return candidate, cached.offset
+                end
             end
         end
-        local firstSafe, firstOffset, firstList = nil, nil, nil
+        local firstSafe, firstOffset, firstList, firstExact = nil, nil, nil, false
         for _, list in ipairs({ self.offsets or { self.offset or CFrame.new(0, 7, -2) }, self.fallback or {} }) do
             local base = anchorFor(list, targetRoot, head)
             if base then
                 for _, offset in ipairs(list) do
                     local candidate = base * offset
-                    if self:IsSafe(candidate.Position, rootPart) then
+                    local safe, exact = self:IsSafe(candidate.Position, rootPart)
+                    if safe then
                         if self:HasLine(candidate.Position, head) then
                             self.pick = { offset = offset, list = list, line = head ~= nil, at = now }
+                            self.pickExact = exact == true
                             return candidate, offset
                         end
                         if not firstSafe then
-                            firstSafe, firstOffset, firstList = candidate, offset, list
+                            firstSafe, firstOffset, firstList, firstExact = candidate, offset, list, exact == true
                         end
                     end
                 end
@@ -1507,9 +1536,11 @@ do
         end
         if firstSafe then
             self.pick = { offset = firstOffset, list = firstList, line = false, at = now }
+            self.pickExact = firstExact
             return firstSafe, firstOffset
         end
         self.pick = nil
+        self.pickExact = false
         return nil
     end
 
@@ -1542,13 +1573,22 @@ do
         local ok, parts = pcall(function()
             return Workspace:GetPartBoundsInRadius(position, CLEARANCE, clearanceParams)
         end)
+        local solid = {}
         if ok and parts then
             for _, part in ipairs(parts) do
-                if part.CanCollide then return false end
+                if part.CanCollide then table.insert(solid, part) end
             end
         end
+        local exact = false
+        if #solid > 0 then
+            local character = target and target.Character
+            local anchor = character and (character:FindFirstChild('Head') or character:FindFirstChild('HumanoidRootPart'))
+            if not anchor or touchesSurface(position, solid, anchor.Position) then return false end
+            exact = true
+        end
 
-        return Workspace:Raycast(position, Vector3.new(0, -GROUND_CHECK, 0), groundParams) ~= nil
+        if Workspace:Raycast(position, Vector3.new(0, -GROUND_CHECK, 0), groundParams) == nil then return false end
+        return true, exact
     end
 
     local function faceToward(position, point)
@@ -1601,6 +1641,7 @@ do
             end
             desyncCFrame = faceToward(desyncCFrame.Position, (head or targetRoot).Position)
             self.placed = desyncCFrame
+            self.placedExact = self.pickExact == true
 
             local backupCFrame = rootPart.CFrame
             local backupVelocity = rootPart.Velocity
@@ -2204,7 +2245,8 @@ do
         return best
     end
 
-    function Tuner:Choose(name)
+    function Tuner:Choose(name, weapon)
+        if weapon then name = self:Scoped(name, weapon) end
         local dim = self.dims[name]
         local pick, fewest = nil, math.huge
         for _, arm in ipairs(dim.order) do
@@ -2297,10 +2339,165 @@ do
     Tuner:AddDimension('reach', { 'move', 'stay' })
     Tuner:AddDimension('reachNear', { 'move', 'stay' })
 
+    local SEEDS = {
+        ["direct@Assault Rifle"] = { near = { 316, 1463 }, camera = { 267, 1240 } },
+        ["direct@Bow"] = { near = { 1, 11 }, camera = { 1, 4 } },
+        ["direct@Burst Rifle"] = { near = { 4, 8 }, camera = { 7, 16 } },
+        ["direct@Daggers"] = { near = { 0, 3 }, camera = { 3, 13 } },
+        ["direct@Energy Pistols"] = { near = { 9, 45 }, camera = { 18, 75 } },
+        ["direct@Energy Rifle"] = { near = { 1, 6 }, camera = { 3, 14 } },
+        ["direct@Grenade Launcher"] = { near = { 1, 14 }, camera = { 1, 2 } },
+        ["direct@Handgun"] = { near = { 39, 118 }, camera = { 53, 110 } },
+        ["direct@Minigun"] = { near = { 5, 22 }, camera = { 12, 34 } },
+        ["direct@Permafrost"] = { near = { 2, 11 }, camera = { 2, 8 } },
+        ["direct@Revolver"] = { near = { 3, 8 }, camera = { 5, 11 } },
+        ["direct@Shotgun"] = { near = { 36, 115 }, camera = { 17, 72 } },
+        ["direct@Slingshot"] = { near = { 7, 16 }, camera = { 1, 13 } },
+        ["direct@Sniper"] = { near = { 14, 40 }, camera = { 31, 83 } },
+        ["direct@Spray"] = { near = { 28, 65 }, camera = { 27, 65 } },
+        ["direct@Uzi"] = { near = { 15, 40 }, camera = { 22, 68 } },
+        ["direct@Wildcat"] = { near = { 9, 48 }, camera = { 2, 17 } },
+        ["facing@Assault Rifle"] = { look = { 1082, 4636 }, old = { 998, 4072 } },
+        ["facing@Bow"] = { look = { 2, 7 }, old = { 3, 33 } },
+        ["facing@Burst Rifle"] = { look = { 29, 61 }, old = { 17, 31 } },
+        ["facing@Daggers"] = { look = { 1, 10 }, old = { 2, 20 } },
+        ["facing@Distortion"] = { look = { 7, 15 }, old = { 0, 1 } },
+        ["facing@Energy Pistols"] = { look = { 30, 261 }, old = { 14, 113 } },
+        ["facing@Energy Rifle"] = { look = { 19, 43 }, old = { 5, 22 } },
+        ["facing@Exogun"] = { old = { 7, 10 } },
+        ["facing@Grenade Launcher"] = { look = { 1, 6 }, old = { 4, 23 } },
+        ["facing@Handgun"] = { look = { 132, 326 }, old = { 155, 366 } },
+        ["facing@Minigun"] = { look = { 14, 104 }, old = { 21, 143 } },
+        ["facing@Permafrost"] = { look = { 6, 25 }, old = { 20, 55 } },
+        ["facing@Revolver"] = { look = { 18, 38 }, old = { 6, 17 } },
+        ["facing@Shorty"] = { look = { 6, 18 }, old = { 1, 5 } },
+        ["facing@Shotgun"] = { look = { 176, 430 }, old = { 123, 296 } },
+        ["facing@Slingshot"] = { look = { 20, 126 }, old = { 17, 119 } },
+        ["facing@Sniper"] = { look = { 65, 166 }, old = { 38, 119 } },
+        ["facing@Spray"] = { look = { 75, 158 }, old = { 88, 206 } },
+        ["facing@Uzi"] = { look = { 60, 219 }, old = { 29, 92 } },
+        ["facing@Wildcat"] = { look = { 44, 171 }, old = { 13, 82 } },
+        ["hitpart@Assault Rifle"] = { hitbox = { 1059, 4443 }, head = { 1021, 4265 } },
+        ["hitpart@Bow"] = { hitbox = { 3, 15 }, head = { 2, 25 } },
+        ["hitpart@Burst Rifle"] = { hitbox = { 18, 30 }, head = { 28, 62 } },
+        ["hitpart@Daggers"] = { hitbox = { 0, 4 }, head = { 4, 26 } },
+        ["hitpart@Distortion"] = { hitbox = { 1, 2 }, head = { 6, 14 } },
+        ["hitpart@Energy Pistols"] = { hitbox = { 35, 206 }, head = { 9, 168 } },
+        ["hitpart@Energy Rifle"] = { hitbox = { 5, 11 }, head = { 19, 54 } },
+        ["hitpart@Exogun"] = { hitbox = { 3, 6 }, head = { 3, 4 } },
+        ["hitpart@Grenade Launcher"] = { hitbox = { 2, 7 }, head = { 3, 22 } },
+        ["hitpart@Handgun"] = { hitbox = { 182, 416 }, head = { 105, 276 } },
+        ["hitpart@Minigun"] = { hitbox = { 18, 102 }, head = { 17, 145 } },
+        ["hitpart@Permafrost"] = { hitbox = { 11, 38 }, head = { 15, 42 } },
+        ["hitpart@Revolver"] = { hitbox = { 10, 25 }, head = { 14, 30 } },
+        ["hitpart@Shorty"] = { hitbox = { 3, 11 }, head = { 4, 12 } },
+        ["hitpart@Shotgun"] = { hitbox = { 129, 358 }, head = { 169, 368 } },
+        ["hitpart@Slingshot"] = { hitbox = { 15, 113 }, head = { 22, 132 } },
+        ["hitpart@Sniper"] = { hitbox = { 41, 105 }, head = { 62, 180 } },
+        ["hitpart@Spray"] = { hitbox = { 98, 219 }, head = { 65, 145 } },
+        ["hitpart@Uzi"] = { hitbox = { 25, 116 }, head = { 64, 195 } },
+        ["hitpart@Wildcat"] = { hitbox = { 24, 113 }, head = { 32, 140 } },
+        ["origin@Assault Rifle"] = { under = { 389, 1419 }, shooter = { 417, 1600 }, clear = { 393, 1602 } },
+        ["origin@Bow"] = { under = { 2, 14 }, shooter = { 0, 2 }, clear = { 0, 2 } },
+        ["origin@Burst Rifle"] = { under = { 6, 14 }, shooter = { 13, 21 }, clear = { 6, 12 } },
+        ["origin@Daggers"] = { under = { 1, 6 }, shooter = { 0, 3 }, clear = { 0, 2 } },
+        ["origin@Energy Pistols"] = { under = { 0, 45 }, shooter = { 3, 93 }, clear = { 9, 76 } },
+        ["origin@Energy Rifle"] = { under = { 6, 15 }, shooter = { 8, 19 }, clear = { 1, 1 } },
+        ["origin@Grenade Launcher"] = { under = { 3, 11 }, shooter = { 0, 1 } },
+        ["origin@Handgun"] = { under = { 47, 110 }, shooter = { 46, 125 }, clear = { 45, 110 } },
+        ["origin@Minigun"] = { under = { 14, 88 }, shooter = { 3, 52 }, clear = { 2, 32 } },
+        ["origin@Permafrost"] = { under = { 9, 19 }, shooter = { 4, 12 } },
+        ["origin@Revolver"] = { under = { 1, 7 }, shooter = { 4, 8 }, clear = { 6, 10 } },
+        ["origin@Shorty"] = { under = { 3, 6 }, shooter = { 1, 2 }, clear = { 1, 2 } },
+        ["origin@Shotgun"] = { under = { 84, 159 }, shooter = { 61, 147 }, clear = { 57, 133 } },
+        ["origin@Slingshot"] = { under = { 11, 86 }, shooter = { 7, 44 }, clear = { 9, 60 } },
+        ["origin@Sniper"] = { under = { 19, 46 }, shooter = { 10, 36 }, clear = { 5, 20 } },
+        ["origin@Spray"] = { under = { 17, 40 }, shooter = { 28, 65 }, clear = { 41, 90 } },
+        ["origin@Uzi"] = { under = { 7, 32 }, shooter = { 28, 70 }, clear = { 7, 62 } },
+        ["origin@Wildcat"] = { under = { 15, 46 }, shooter = { 10, 53 }, clear = { 8, 35 } },
+        ["point@Assault Rifle"] = { center = { 528, 2269 }, lead = { 474, 2065 }, split = { 514, 2120 }, ahead = { 563, 2254 } },
+        ["point@Bow"] = { center = { 3, 21 }, lead = { 0, 4 }, split = { 1, 8 }, ahead = { 1, 7 } },
+        ["point@Burst Rifle"] = { center = { 16, 30 }, lead = { 18, 39 }, split = { 4, 7 }, ahead = { 9, 16 } },
+        ["point@Daggers"] = { center = { 0, 6 }, lead = { 1, 8 }, split = { 1, 7 }, ahead = { 2, 9 } },
+        ["point@Distortion"] = { center = { 1, 2 }, lead = { 7, 13 }, split = { 0, 1 } },
+        ["point@Energy Pistols"] = { center = { 7, 75 }, lead = { 7, 75 }, split = { 20, 123 }, ahead = { 10, 101 } },
+        ["point@Energy Rifle"] = { center = { 3, 9 }, lead = { 8, 15 }, split = { 4, 14 }, ahead = { 10, 27 } },
+        ["point@Exogun"] = { lead = { 2, 5 }, ahead = { 4, 5 } },
+        ["point@Grenade Launcher"] = { center = { 0, 2 }, lead = { 0, 2 }, split = { 0, 1 }, ahead = { 5, 24 } },
+        ["point@Handgun"] = { center = { 93, 209 }, lead = { 71, 179 }, split = { 61, 150 }, ahead = { 62, 154 } },
+        ["point@Minigun"] = { center = { 17, 95 }, lead = { 5, 60 }, split = { 2, 40 }, ahead = { 11, 52 } },
+        ["point@Permafrost"] = { center = { 14, 42 }, lead = { 5, 20 }, split = { 5, 14 }, ahead = { 2, 4 } },
+        ["point@Revolver"] = { center = { 6, 14 }, lead = { 5, 14 }, split = { 5, 9 }, ahead = { 8, 18 } },
+        ["point@Shorty"] = { center = { 2, 11 }, lead = { 1, 3 }, split = { 1, 3 }, ahead = { 3, 6 } },
+        ["point@Shotgun"] = { center = { 82, 188 }, lead = { 79, 189 }, split = { 72, 189 }, ahead = { 65, 160 } },
+        ["point@Slingshot"] = { center = { 8, 48 }, lead = { 10, 70 }, split = { 7, 54 }, ahead = { 12, 73 } },
+        ["point@Sniper"] = { center = { 25, 73 }, lead = { 32, 89 }, split = { 33, 79 }, ahead = { 13, 44 } },
+        ["point@Spray"] = { center = { 41, 87 }, lead = { 37, 77 }, split = { 38, 88 }, ahead = { 47, 112 } },
+        ["point@Uzi"] = { center = { 23, 81 }, lead = { 5, 21 }, split = { 15, 78 }, ahead = { 45, 131 } },
+        ["point@Wildcat"] = { center = { 13, 52 }, lead = { 4, 41 }, split = { 19, 56 }, ahead = { 20, 104 } },
+        ["reach@Assault Rifle"] = { move = { 135, 689 }, stay = { 143, 601 } },
+        ["reach@Bow"] = { move = { 1, 7 }, stay = { 0, 3 } },
+        ["reach@Burst Rifle"] = { move = { 4, 10 }, stay = { 9, 20 } },
+        ["reach@Energy Pistols"] = { move = { 1, 4 }, stay = { 0, 15 } },
+        ["reach@Handgun"] = { move = { 12, 35 }, stay = { 20, 41 } },
+        ["reach@Permafrost"] = { move = { 7, 21 }, stay = { 1, 15 } },
+        ["reach@Revolver"] = { move = { 3, 9 }, stay = { 4, 9 } },
+        ["reach@Shotgun"] = { move = { 16, 41 }, stay = { 21, 58 } },
+        ["reach@Slingshot"] = { move = { 0, 3 }, stay = { 0, 7 } },
+        ["reach@Sniper"] = { move = { 12, 31 }, stay = { 8, 25 } },
+        ["reach@Spray"] = { move = { 9, 14 }, stay = { 14, 29 } },
+        ["reach@Uzi"] = { move = { 5, 8 }, stay = { 3, 17 } },
+        ["reach@Wildcat"] = { move = { 2, 8 }, stay = { 4, 21 } },
+        ["reachNear@Assault Rifle"] = { move = { 124, 521 }, stay = { 250, 997 } },
+        ["reachNear@Burst Rifle"] = { move = { 4, 7 }, stay = { 3, 8 } },
+        ["reachNear@Energy Pistols"] = { move = { 1, 15 }, stay = { 27, 114 } },
+        ["reachNear@Handgun"] = { move = { 43, 79 }, stay = { 26, 74 } },
+        ["reachNear@Minigun"] = { move = { 0, 1 }, stay = { 10, 28 } },
+        ["reachNear@Permafrost"] = { move = { 2, 8 }, stay = { 3, 5 } },
+        ["reachNear@Shotgun"] = { move = { 22, 44 }, stay = { 17, 55 } },
+        ["reachNear@Slingshot"] = { move = { 2, 23 }, stay = { 7, 22 } },
+        ["reachNear@Sniper"] = { move = { 11, 21 }, stay = { 6, 14 } },
+        ["reachNear@Spray"] = { move = { 12, 18 }, stay = { 17, 32 } },
+        ["reachNear@Uzi"] = { move = { 4, 11 }, stay = { 14, 38 } },
+        ["reachNear@Wildcat"] = { move = { 10, 38 }, stay = { 7, 44 } },
+    }
+    local SEED_CAP = 40
+    local PRIOR = 0.2
+
+    function Tuner:Scoped(name, weapon)
+        local key = name .. '@' .. weapon
+        if self.dims[key] then return key end
+        local base = self.dims[name]
+        if not base then return name end
+        local seed = SEEDS[key]
+        local total = 0
+        if seed then
+            for _, armName in ipairs(base.order) do
+                if seed[armName] then total += seed[armName][2] end
+            end
+        end
+        local scale = total > SEED_CAP and SEED_CAP / total or 1
+        local dim = { order = base.order, arms = {} }
+        for _, armName in ipairs(base.order) do
+            local global, mine = base.arms[armName], seed and seed[armName]
+            dim.arms[armName] = {
+                assigned = MIN_TRIALS,
+                finished = global.finished * PRIOR + (mine and mine[2] * scale or 0),
+                hits = math.min(global.hits, global.finished) * PRIOR + (mine and mine[1] * scale or 0),
+            }
+        end
+        self.dims[key] = dim
+        return key
+    end
+
     local FILE = 'rivals_tuner.json'
     local VERSION = 4
 
     local function inherit(source)
+        for name in pairs(source) do
+            local base, weapon = string.match(name, '^(.-)@(.+)$')
+            if base then Tuner:Scoped(base, weapon) end
+        end
         for name, dim in pairs(Tuner.dims) do
             local old = source[name]
             if type(old) == 'table' then
@@ -2378,13 +2575,17 @@ env.RivalsStats = {
     hookErrors = 0,
     hookErrorList = {},
     maxDamage = setmetatable({}, { __mode = 'k' }),
+    lateWatch = setmetatable({}, { __mode = 'k' }),
 }
 do
     local Stats = env.RivalsStats
     local HIT_WINDOW = 0.6
+    local LATE_WINDOW = 3
+    local INFO_KEYS = 60
+    local INFO_WORDS = { 'projectile', 'gravity', 'speed', 'velocity', 'drop', 'drag', 'arc', 'charge', 'lifetime', 'range', 'travel', 'bullet', 'radius' }
     local LOG_SIZE = 5000
     local CONSOLE_LINES = 30
-    local SCRIPT_CHECKPOINT = 58
+    local SCRIPT_CHECKPOINT = 61
     local SCRIPT_VERSION = '체크포인트 ' .. SCRIPT_CHECKPOINT
     env.RivalsVersion = SCRIPT_VERSION
 
@@ -2447,6 +2648,7 @@ do
             self.hits += 1
             self.lastHit = { target = record.target, t = os.clock() }
             record.damage = damage
+            record.delay = self.clock() - record.t
             if damage and record.weapon ~= nil then
                 local best = math.max(self.maxDamage[record.weapon] or 0, damage)
                 self.maxDamage[record.weapon] = best
@@ -2475,9 +2677,13 @@ do
                 if hit then self.windowHits += 1 end
             end
         end
-        if counted and record.info.arms and not record.info.invincible then
+        if counted and record.info.arms and not record.info.invincible and record.info.moved ~= false then
+            local weaponName = record.info.weaponName
             for dimension, arm in pairs(record.info.arms) do
                 env.RivalsTuner:Credit(dimension, arm, credit)
+                if weaponName then
+                    env.RivalsTuner:Credit(dimension .. '@' .. weaponName, arm, credit)
+                end
             end
         end
         if env.RivalsTargetState then
@@ -2503,7 +2709,7 @@ do
         if self.hookWarned or self.hookCalls > 0 then return end
         local fire = env.RivalsFire
         if not fire or fire.presses < 5 or not fire.firstPress then return end
-        if self.clock() - fire.firstPress < 3 then return end
+        if self.clock() - fire.firstPress < 20 then return end
 
         self.hookWarned = true
         local text = '마우스를 ' .. fire.presses .. '번 눌렀는데 한 번도 안 불렸다'
@@ -2537,16 +2743,35 @@ do
                 record.result = 'dead'
             elseif humanoid == nil or now - record.t > HIT_WINDOW then
                 self:Resolve(record, false)
+                if humanoid ~= nil then
+                    self.lateWatch[humanoid] = { record = record, health = humanoid.Health }
+                end
             else
                 table.insert(keep, record)
             end
         end
+        local aimed = {}
         for _, record in ipairs(keep) do
-            if record.humanoid and newHealth[record.humanoid] ~= nil then
-                record.health = newHealth[record.humanoid]
+            if record.humanoid then
+                aimed[record.humanoid] = true
+                if newHealth[record.humanoid] ~= nil then
+                    record.health = newHealth[record.humanoid]
+                end
             end
         end
         self.pending = keep
+        for humanoid, watch in pairs(self.lateWatch) do
+            local health = humanoid.Health
+            if now - watch.record.t > LATE_WINDOW then
+                self.lateWatch[humanoid] = nil
+            elseif aimed[humanoid] or credit[humanoid] or health >= watch.health - 0.001 then
+                watch.health = health
+            else
+                watch.record.late = now - watch.record.t
+                watch.record.lateDamage = watch.health - math.max(health, 0)
+                self.lateWatch[humanoid] = nil
+            end
+        end
     end
 
     local function describeKey(key)
@@ -2614,6 +2839,75 @@ do
 
     local function csvNumber(number)
         return number and string.format('%.1f', number) or ''
+    end
+
+    local function shortText(text)
+        local ok, stop = pcall(utf8.offset, text, 25)
+        if not ok then return string.sub(text, 1, 24) end
+        if stop then return string.sub(text, 1, stop - 1) .. '…' end
+        return text
+    end
+
+    local function infoText(value)
+        local kind = typeof(value)
+        if kind == 'number' then
+            return string.format('%.6g', value)
+        elseif kind == 'boolean' or kind == 'EnumItem' then
+            return tostring(value)
+        elseif kind == 'string' then
+            return '"' .. shortText(value) .. '"'
+        elseif kind == 'Vector3' or kind == 'Vector2' or kind == 'NumberRange' or kind == 'Color3' then
+            return '(' .. tostring(value) .. ')'
+        elseif kind == 'Instance' then
+            return '<' .. value.ClassName .. '>'
+        end
+        return nil
+    end
+
+    local function gunInfoText(gun)
+        local saved = savedInfo[gun]
+        local entries = {}
+        local function add(path, value, changed)
+            local ok, text = pcall(infoText, value)
+            if not ok or text == nil then return end
+            local lower, rank = string.lower(path), 1
+            for _, word in ipairs(INFO_WORDS) do
+                if string.find(lower, word, 1, true) then
+                    rank = 0
+                    break
+                end
+            end
+            table.insert(entries, { path = path, text = text .. (changed and '*' or ''), rank = rank })
+        end
+        pcall(function()
+            for key, value in pairs(gun) do
+                local path = tostring(key)
+                local changed = saved ~= nil and saved[key] ~= nil
+                if changed then value = saved[key] or nil end
+                if type(value) == 'table' then
+                    local n = 0
+                    for innerKey, innerValue in pairs(value) do
+                        n += 1
+                        if n > 40 then break end
+                        if type(innerValue) ~= 'table' then
+                            add(path .. '.' .. tostring(innerKey), innerValue, false)
+                        end
+                    end
+                elseif value ~= nil then
+                    add(path, value, changed)
+                end
+            end
+        end)
+        if #entries == 0 then return '(읽을 값 없음)' end
+        table.sort(entries, function(a, b)
+            if a.rank ~= b.rank then return a.rank < b.rank end
+            return a.path < b.path
+        end)
+        local parts = {}
+        for i = 1, math.min(#entries, INFO_KEYS) do
+            table.insert(parts, entries[i].path .. '=' .. entries[i].text)
+        end
+        return table.concat(parts, ', ') .. (#entries > INFO_KEYS and string.format(' 외 %d개', #entries - INFO_KEYS) or '')
     end
 
     function Stats:Text()
@@ -2737,6 +3031,7 @@ do
             local bucketStats = {}
             for i = 1, #buckets do bucketStats[i] = { 0, 0 } end
             local weapons, weaponOrder = {}, {}
+            local moves = { moved = { 0, 0 }, exact = { 0, 0 }, stuck = { 0, 0 } }
             local total = 0
             for _, record in ipairs(self.log) do
                 if record.result ~= 'pending' then
@@ -2746,6 +3041,15 @@ do
                     local side = info.direct and direct or wall
                     side[1] += hit
                     side[2] += 1
+                    if info.moved ~= nil then
+                        local move = info.moved and moves.moved or moves.stuck
+                        move[1] += hit
+                        move[2] += 1
+                        if info.exact then
+                            moves.exact[1] += hit
+                            moves.exact[2] += 1
+                        end
+                    end
                     if info.distance then
                         for i, bucket in ipairs(buckets) do
                             if info.distance < bucket[1] then
@@ -2771,6 +3075,10 @@ do
             end
             if total > 0 then
                 table.insert(lines, string.format('구분: 직접 %d/%d  벽 뒤 %d/%d', direct[1], direct[2], wall[1], wall[2]))
+                if moves.moved[2] + moves.stuck[2] > 0 then
+                    table.insert(lines, string.format('몸 이동: 옮김 %d/%d (그중 정밀 검사로 찾은 자리 %d/%d)  자리 없음 %d/%d',
+                        moves.moved[1], moves.moved[2], moves.exact[1], moves.exact[2], moves.stuck[1], moves.stuck[2]))
+                end
                 local parts = {}
                 for i, bucket in ipairs(buckets) do
                     table.insert(parts, string.format('%s %d/%d', bucket[2], bucketStats[i][1], bucketStats[i][2]))
@@ -2796,6 +3104,44 @@ do
             end
             if kills + deaths + taken > 0 then
                 table.insert(lines, string.format('사건: 킬 %d  죽음 %d  피격 %d번(합계 %d)', kills, deaths, taken, takenSum))
+            end
+        end
+        do
+            local guns, order = {}, {}
+            for _, record in ipairs(self.log) do
+                local info = record.info or {}
+                local name = info.weaponName
+                if name then
+                    local entry = guns[name]
+                    if not entry then
+                        entry = { delays = {}, late = {}, lateDamage = 0 }
+                        guns[name] = entry
+                        table.insert(order, name)
+                    end
+                    if type(info.gun) == 'table' then entry.gun = info.gun end
+                    if record.result == 'hit' and record.delay then
+                        table.insert(entry.delays, record.delay)
+                    end
+                    if record.late then
+                        table.insert(entry.late, record.late)
+                        entry.lateDamage += record.lateDamage or 0
+                    end
+                end
+            end
+            for _, name in ipairs(order) do
+                local entry = guns[name]
+                local delays, late = entry.delays, entry.late
+                if #delays > 0 then
+                    table.sort(delays)
+                    table.insert(lines, string.format('명중 지연 %s: 중간값 %.2f초, 가장 늦은 %.2f초 (%d발)', name, delays[math.ceil(#delays / 2)], delays[#delays], #delays))
+                end
+                if #late > 0 then
+                    table.sort(late)
+                    table.insert(lines, string.format('늦은 피해 %s: %d번, 쏜 뒤 %.2f~%.2f초 (중간값 %.2f초), 피해 합계 %.0f', name, #late, late[1], late[#late], late[math.ceil(#late / 2)], entry.lateDamage))
+                end
+                if entry.gun then
+                    table.insert(lines, '무기 정보 ' .. name .. ': ' .. gunInfoText(entry.gun))
+                end
             end
         end
         local rows = windowRows(self.log)
@@ -2873,6 +3219,8 @@ do
             end
             if info.moved == false then
                 arms = arms .. '  몸 안 옮김'
+            elseif info.exact then
+                arms = arms .. '  정밀 검사 자리'
             end
             if info.edge then
                 arms = arms .. '  머리 일부만 보임'
@@ -2891,6 +3239,12 @@ do
             end
             if record.damage then
                 arms = arms .. '  피해 ' .. string.format('%.0f', record.damage) .. (record.best and string.format('/%.0f', record.best) or '')
+            end
+            if record.result == 'hit' and record.delay then
+                arms = arms .. string.format('  지연 %.2f', record.delay)
+            end
+            if record.late then
+                arms = arms .. string.format('  늦은 피해 %.2f초(%.0f)', record.late, record.lateDamage or 0)
             end
             if info.weaponName then
                 arms = arms .. '  무기 ' .. info.weaponName
@@ -2930,7 +3284,7 @@ do
                 local info, arms = row.info, row.info.arms or {}
                 local kind = info.body and 'body' or info.escape and 'escape' or info.direct and (info.visible and 'visible' or 'direct') or (arms.desync and 'wall' or 'other')
                 local flags = {}
-                for _, flag in ipairs({ 'silent', 'meleeSafe', 'edge', 'invincible', 'flank', 'control', 'retargeted' }) do
+                for _, flag in ipairs({ 'silent', 'meleeSafe', 'edge', 'invincible', 'flank', 'control', 'retargeted', 'exact' }) do
                     if info[flag] then table.insert(flags, flag) end
                 end
                 if info.block then table.insert(flags, 'block=' .. tostring(info.block)) end
@@ -3040,6 +3394,7 @@ do
             end
         end
         self.log = {}
+        table.clear(self.lateWatch)
         local antiAim = env.RivalsAntiAimStats
         if antiAim then
             antiAim.threats, antiAim.meleeTime, antiAim.dodgeTime, antiAim.shieldTime, antiAim.sinkTime = 0, 0, 0, 0, 0
@@ -3278,7 +3633,9 @@ do
             return current
         end
         self.count += 1
-        current = { id = self.count, controller = controller, startsAt = now, endsAt = now + realCycle(controller), requests = 1, choices = {} }
+        local weapon = nil
+        pcall(function() weapon = controller.Name end)
+        current = { id = self.count, controller = controller, weapon = type(weapon) == 'string' and weapon or nil, startsAt = now, endsAt = now + realCycle(controller), requests = 1, choices = {} }
         self.current = current
         return current
     end
@@ -3286,7 +3643,7 @@ do
     function ShotWindow:Choose(window, name)
         local choice = window.choices[name]
         if choice == nil then
-            choice = env.RivalsTuner:Choose(name)
+            choice = env.RivalsTuner:Choose(name, window.weapon)
             window.choices[name] = choice
         end
         return choice
@@ -3562,9 +3919,10 @@ do
         cameraData[utf8.char(2)] = hitPart
         cameraData[utf8.char(3)] = Utility:EncodeCFrame(shootingOffset)
 
-        local moved = nil
+        local moved, exact = nil, nil
         if desyncArm ~= 'none' then
             moved = DesyncController.active == true and DesyncController.placed ~= nil
+            exact = (moved and DesyncController.placedExact == true) or nil
         end
         local arms = { point = pointArm, facing = facingArm, hitpart = partArm }
         if reachDim then
@@ -3581,7 +3939,7 @@ do
             arms.direct = nil
         end
         local weapon = type(controller) == 'table' and controller.Info or controller
-        env.RivalsStats:Record(targetPlayer, { arms = arms, moved = moved, direct = direct or nil, visible = visible or nil, retargeted = retargeted or nil, edge = edge or nil, weapon = weapon, weaponName = weaponName ~= nil and tostring(weaponName) or nil, silent = silent or nil, meleeSafe = meleeSafe or nil, escape = escape or nil, invincible = targetState:IsInvincible(targetPlayer) or nil, block = block, flank = flank, control = control, window = window })
+        env.RivalsStats:Record(targetPlayer, { arms = arms, moved = moved, exact = exact, direct = direct or nil, visible = visible or nil, retargeted = retargeted or nil, edge = edge or nil, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, silent = silent or nil, meleeSafe = meleeSafe or nil, escape = escape or nil, invincible = targetState:IsInvincible(targetPlayer) or nil, block = block, flank = flank, control = control, window = window })
 
         self:ArmCleanup()
     end
@@ -3602,7 +3960,7 @@ do
         cameraData[utf8.char(2)] = part
         cameraData[utf8.char(3)] = Utility:EncodeCFrame(part.CFrame:ToObjectSpace(CFrame.new(point)))
         local weapon = type(controller) == 'table' and controller.Info or controller
-        env.RivalsStats:Record(targetPlayer, { direct = true, visible = true, silent = true, body = true, weapon = weapon, weaponName = weaponName ~= nil and tostring(weaponName) or nil, window = window })
+        env.RivalsStats:Record(targetPlayer, { direct = true, visible = true, silent = true, body = true, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, window = window })
     end
 
     function WallbangController:Stop()
