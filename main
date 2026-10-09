@@ -84,7 +84,7 @@ local function showSplash()
 
 	local mounted = false
 	if gethui then
-		mounted = pcall(function() gui.Parent = gethui() end)
+		mounted = pcall(function() gui.Parent = gethui() end) and gui.Parent ~= nil
 	end
 	if not mounted then
 		mounted = pcall(function() gui.Parent = game:GetService("CoreGui") end)
@@ -469,8 +469,8 @@ if hookmetamethod then
                     favorites[args[1]][args[2]] = args[3] or nil
                     saveConfig()
                     task.spawn(function() pcall(function() DataController.CurrentData:Replicate("FavoritedCosmetics") end) end)
+                    return
                 end
-                return
             end
             return oldNamecall(self, ...)
         end)
@@ -625,8 +625,8 @@ if hookmetamethod then
                     favorites[args[1]][args[2]] = args[3] or nil
                     saveConfig()
                     task.spawn(function() pcall(function() DataController.CurrentData:Replicate("FavoritedCosmetics") end) end)
+                    return
                 end
-                return
             end
             return oldNamecall(self, ...)
         end)
@@ -768,8 +768,8 @@ if hookmetamethod then
                     favorites[args[1]][args[2]] = args[3] or nil
                     saveConfig()
                     task.spawn(function() pcall(function() DataController.CurrentData:Replicate("FavoritedCosmetics") end) end)
+                    return
                 end
-                return
             end
             return oldNamecall(self, ...)
         end)
@@ -892,8 +892,8 @@ if hookmetamethod then
                     favorites[args[1]][args[2]] = args[3] or nil
                     saveConfig()
                     task.spawn(function() pcall(function() DataController.CurrentData:Replicate("FavoritedCosmetics") end) end)
+                    return
                 end
-                return
             end
             return oldNamecall(self, ...)
         end)
@@ -1165,6 +1165,7 @@ env.RivalsSafety = {
     spinDeaths = 0,
     flings = 0,
     rescues = 0,
+    zoneRefusals = 0,
     deathLog = {},
     lastRecover = env.RivalsSafety and env.RivalsSafety.lastRecover or 0,
     history = {},
@@ -1421,6 +1422,7 @@ do
     local groundParams = RaycastParams.new()
     groundParams.FilterType = Enum.RaycastFilterType.Exclude
     groundParams.IgnoreWater = true
+    groundParams.RespectCanCollide = true
     local clearanceParams = OverlapParams.new()
     clearanceParams.FilterType = Enum.RaycastFilterType.Exclude
     local sightParams = RaycastParams.new()
@@ -1464,6 +1466,11 @@ do
             if Workspace:Raycast(position, direction * CLEARANCE, surfaceParams) then return true end
         end
         return false
+    end
+
+    local function isZone(part)
+        if part.Name == 'Barriers' or (part.Parent and part.Parent.Name == 'Barriers') then return true end
+        return part:HasTag('OutOfBoundsPart') or part:HasTag('KillBrick')
     end
 
     function DesyncController:Sight(from, to, head)
@@ -1576,6 +1583,10 @@ do
         local solid = {}
         if ok and parts then
             for _, part in ipairs(parts) do
+                if isZone(part) then
+                    self.zoned = true
+                    return false
+                end
                 if part.CanCollide then table.insert(solid, part) end
             end
         end
@@ -1587,7 +1598,12 @@ do
             exact = true
         end
 
-        if Workspace:Raycast(position, Vector3.new(0, -GROUND_CHECK, 0), groundParams) == nil then return false end
+        local ground = Workspace:Raycast(position, Vector3.new(0, -GROUND_CHECK, 0), groundParams)
+        if ground == nil then return false end
+        if isZone(ground.Instance) then
+            self.zoned = true
+            return false
+        end
         return true, exact
     end
 
@@ -1631,7 +1647,11 @@ do
             self.currentTarget = target
 
             local head = target.Character:FindFirstChild('Head')
+            self.zoned = false
             local desyncCFrame, offset = self:Pick(targetRoot, head, rootPart)
+            if self.zoned then
+                env.RivalsSafety.zoneRefusals += 1
+            end
             if desyncCFrame then
                 self.offset = offset
             end
@@ -2583,9 +2603,15 @@ do
     local LATE_WINDOW = 3
     local INFO_KEYS = 60
     local INFO_WORDS = { 'projectile', 'gravity', 'speed', 'velocity', 'drop', 'drag', 'arc', 'charge', 'lifetime', 'range', 'travel', 'bullet', 'radius' }
+
+    local function middle(sorted)
+        local n = #sorted
+        if n % 2 == 1 then return sorted[(n + 1) / 2] end
+        return (sorted[n / 2] + sorted[n / 2 + 1]) / 2
+    end
     local LOG_SIZE = 5000
     local CONSOLE_LINES = 30
-    local SCRIPT_CHECKPOINT = 62
+    local SCRIPT_CHECKPOINT = 64
     local SCRIPT_VERSION = '체크포인트 ' .. SCRIPT_CHECKPOINT
     env.RivalsVersion = SCRIPT_VERSION
 
@@ -2987,7 +3013,7 @@ do
         local safety = env.RivalsSafety
         if safety then
             table.insert(lines, string.format('안전: 사망(디싱크 %d, 튕김 %d, 회전 %d)  속도제한 %d  추락복구 %d  사거리 x%.2f',
-                safety.desyncDeaths, safety.jitterDeaths, safety.spinDeaths, safety.flings, safety.rescues, safety.rangeScale) .. (safety.jitterScale < 1 and string.format('  튕김폭 x%.2f', safety.jitterScale) or '') .. ((safety.jitterPulls + safety.jitterFlings) > 0 and string.format('  안티에임 이상(끌림 %d, 속도 %d)', safety.jitterPulls, safety.jitterFlings) or ''))
+                safety.desyncDeaths, safety.jitterDeaths, safety.spinDeaths, safety.flings, safety.rescues, safety.rangeScale) .. ((safety.zoneRefusals or 0) > 0 and string.format('  킬존 자리 거부 %d프레임', safety.zoneRefusals) or '') .. (safety.jitterScale < 1 and string.format('  튕김폭 x%.2f', safety.jitterScale) or '') .. ((safety.jitterPulls + safety.jitterFlings) > 0 and string.format('  안티에임 이상(끌림 %d, 속도 %d)', safety.jitterPulls, safety.jitterFlings) or ''))
         end
         local antiAim = env.RivalsAntiAimStats
         if antiAim and (antiAim.threats > 0 or antiAim.shieldTime > 0 or antiAim.sinkTime > 0) then
@@ -3133,11 +3159,11 @@ do
                 local delays, late = entry.delays, entry.late
                 if #delays > 0 then
                     table.sort(delays)
-                    table.insert(lines, string.format('명중 지연 %s: 중간값 %.2f초, 가장 늦은 %.2f초 (%d발)', name, delays[math.ceil(#delays / 2)], delays[#delays], #delays))
+                    table.insert(lines, string.format('명중 지연 %s: 중간값 %.2f초, 가장 늦은 %.2f초 (%d발)', name, middle(delays), delays[#delays], #delays))
                 end
                 if #late > 0 then
                     table.sort(late)
-                    table.insert(lines, string.format('늦은 피해 %s: %d번, 쏜 뒤 %.2f~%.2f초 (중간값 %.2f초), 피해 합계 %.0f', name, #late, late[1], late[#late], late[math.ceil(#late / 2)], entry.lateDamage))
+                    table.insert(lines, string.format('늦은 피해 %s: %d번, 쏜 뒤 %.2f~%.2f초 (중간값 %.2f초), 피해 합계 %.0f', name, #late, late[1], late[#late], middle(late), entry.lateDamage))
                 end
                 if entry.gun then
                     table.insert(lines, '무기 정보 ' .. name .. ': ' .. gunInfoText(entry.gun))
@@ -4182,7 +4208,9 @@ local heartbeat = RunService.Heartbeat:Connect(function()
 	local origin = camera.CFrame.Position
 	local espOn = not cfg or cfg.esp ~= false
 
-	rayParams.FilterDescendantsInstances = buildFilter(camera)
+	if espOn and next(tracked) ~= nil then
+		rayParams.FilterDescendantsInstances = buildFilter(camera)
+	end
 
 	for targetPlayer, data in pairs(tracked) do
 		local alive = data.humanoid ~= nil and data.humanoid.Health > 0
@@ -4611,8 +4639,7 @@ local zoneParams = OverlapParams.new()
 zoneParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local function hasTag(part, tag)
-	local ok, tagged = pcall(function() return part:HasTag(tag) end)
-	return ok and tagged == true
+	return part:HasTag(tag)
 end
 
 local function inKillZone(spot, character)
@@ -5024,6 +5051,7 @@ local function sanitize(raw)
 	local pet = raw.pet
 	if type(pet) == "table" then
 		if type(pet.show) == "boolean" then out.pet.show = pet.show end
+		if type(pet.swear) == "boolean" then out.pet.swear = pet.swear end
 		if finite(pet.chatter) and pet.chatter >= 1 and pet.chatter <= 3 then
 			out.pet.chatter = math.floor(pet.chatter + 0.5)
 		end
@@ -5354,7 +5382,7 @@ local function mount(screenGui)
 	if gethui then
 		mounted = pcall(function()
 			screenGui.Parent = gethui()
-		end)
+		end) and screenGui.Parent ~= nil
 	end
 	if not mounted then
 		mounted = pcall(function()
@@ -5619,6 +5647,14 @@ local ROWS = {
 			touch()
 		end,
 	},
+	petSwear = {
+		type = "toggle", id = "petSwear", label = "욕", group = 2, icon = "flame", color = C.red,
+		get = function() return petSettings().swear ~= false end,
+		set = function(value)
+			petSettings().swear = value
+			touch()
+		end,
+	},
 	petChatter = {
 		type = "segment", id = "petChatter", label = "말수", group = 2, icon = "bubble", color = C.green,
 		options = { { 1, "적게" }, { 2, "보통" }, { 3, "많이" } },
@@ -5664,6 +5700,7 @@ local APPS = {
 		rows = {
 			ROWS.petShow,
 			ROWS.petChatter,
+			ROWS.petSwear,
 			{
 				type = "button", id = "petReset", label = "위치 초기화", group = 3, icon = "reset", color = C.blue,
 				run = function()
@@ -5796,7 +5833,7 @@ local function recolor(glyphObject, color)
 	for _, part in ipairs(glyphObject:GetDescendants()) do
 		if part:IsA("UIStroke") then
 			part.Color = color
-		elseif part:IsA("Frame") and (part.BackgroundTransparency or 0) < 1 then
+		elseif part:IsA("Frame") and part.BackgroundTransparency < 1 then
 			part.BackgroundColor3 = color
 		end
 	end
@@ -5994,7 +6031,6 @@ ui.cover = new("Frame", {
 	Name = "Cover", BackgroundColor3 = C.blue, BorderSizePixel = 0, Size = UDim2.fromScale(1, 1), ZIndex = 50,
 }, ui.appPage)
 ui.coverCorner = corner(ui.cover, SCREEN_RADIUS)
-ui.coverGlyph = nil
 
 ui.homeBar = new("TextButton", {
 	Name = "HomeBar", Text = "", AutoButtonColor = false, BackgroundTransparency = 1, BorderSizePixel = 0,
@@ -6148,12 +6184,14 @@ do
 			if element.shown == want then return end
 			local first = element.shown == nil
 			element.shown = want
+			local found = false
 			for index, entry in ipairs(buttons) do
 				local on = entry.value == want
 				entry.button:SetAttribute("Selected", on)
 				entry.button.Font = on and FONT_BOLD or FONT
 				entry.button.TextTransparency = on and 0 or 0.25
 				if on then
+					found = true
 					if first then
 						Motion.set(chipKey, index, place)
 					else
@@ -6161,6 +6199,7 @@ do
 					end
 				end
 			end
+			chip.Visible = found
 		end
 		function element.choose(value)
 			row.set(value)
@@ -6205,7 +6244,9 @@ do
 			Motion.spring(key, 1, { duration = 0.22 }, paint)
 		end)
 		button.MouseButton1Click:Connect(function()
-			pcall(row.run)
+			local ok, err = pcall(row.run)
+			if not ok then
+			end
 			if refreshAll then refreshAll() end
 		end)
 		return button
@@ -6694,7 +6735,8 @@ function refreshAll()
 	local _, hits, rate = statusContent()
 	local percent = rate and string.format("%d%%", math.floor(rate * 100 + 0.5)) or nil
 	ui.rateLabel.Text = percent or ""
-	ui.batteryLevel.Size = px(22 * math.clamp(rate or 1, 0.06, 1), 8.5)
+	ui.batteryLevel.Visible = rate ~= nil
+	if rate then ui.batteryLevel.Size = px(22 * math.clamp(rate, 0.06, 1), 8.5) end
 	ui.ccHits.Text = hits or "명중 기록 없음"
 	ui.ccSub.Text = env.RivalsVersion or "체크포인트 ?"
 	ui.ccRate.Text = percent or "—"
@@ -7007,6 +7049,7 @@ settings.pet = settings.pet or {}
 local P = settings.pet
 if type(P.show) ~= "boolean" then P.show = true end
 if type(P.chatter) ~= "number" then P.chatter = 2 end
+if type(P.swear) ~= "boolean" then P.swear = true end
 
 local function touch()
 	if menu and menu.Touch then menu.Touch() end
@@ -7367,7 +7410,7 @@ local SITUATIONS = {
 	} },
 	tripleKill = { level = 1, priority = 4, lines = {
 		"트리플킬!!! 미친 ㅅㅂ", "셋 연속이라고 ㄷㄷㄷ", "혼자 다 쓸어버리네 ㅋㅋ 미쳤다", "트리플!! 오늘 뭐임 ㅋㅋ", "트리플!!! 개대박", "세 놈 연속 ㄷㄷ", "혼자서 셋을? 실화냐 ㅅㅂ", "트리플킬 레전드 ㅇㅈ", "멀티킬 장인 ㅅㅂ", "세 놈 싹쓸이 ㅋㅋ",
-		"오늘 날 잡았네 개미쳤다", "이게 되네 ㅋㅋㅋ 어이없네", "트리플킬 박제각 ㅅㅂ", "셋 다 뒤졌다 ㅋㅋ", "진짜 미쳤다 ㅈㄴ 쩐다", "세 명 연속이다 ㄷㄷㄷ ㅅㅂ", "혼자서 셋을 잡았네 ㅋㅋ 미친", "레전드 등장 트리플킬 씨발", "멀티킬 장인 인정 ㅇㅈ", "세 명 싹쓸이 끝났다 ㅅㅂ",
+		"셋 다 내 거다 ㅋㅋ 씨발 개쩐다", "이게 되네 ㅋㅋㅋ 어이없네", "트리플킬 박제각 ㅅㅂ", "셋 다 뒤졌다 ㅋㅋ", "진짜 미쳤다 ㅈㄴ 쩐다", "세 명 연속이다 ㄷㄷㄷ ㅅㅂ", "혼자서 셋을 잡았네 ㅋㅋ 미친", "레전드 등장 트리플킬 씨발", "멀티킬 장인 인정 ㅇㅈ", "세 명 싹쓸이 끝났다 ㅅㅂ",
 		"오늘 작정했구나 ㅋㅋ", "트리플 실화냐? 미친 ㅋㅋ", "박제각이다 트리플킬 ㅅㅂ!", "진짜로 미쳤다 ㅅㅂ", "트리플킬 전설 났다", "세 명 연속 처치 존나 대단하네", "정신없이 쏘고 쏘고 또 쏘고!", "파티다 파티 트리플킬 ㅅㅂ!", "세 놈이 우수수 뒤졌다 ㅋㅋ",
 		"트리플 기록 추가 ㄷㄷ 개쩔어", "오늘 판 완전 씹어먹네", "소름 돋잖아 트리플킬 ㅅㅂ", "셋을 한꺼번에 날려 버렸네", "이 실력 어디서 나왔냐 ㅋㅋ", "명장면 완성 트리플킬 ㅅㅂ", "셋 다 잡고 여유롭게 서 있네 ㅋㅋ", "기절할 뻔했다 트리플킬 ㅅㅂ",
 		"빠르고 정확하게 셋 처리했네 ㅋㅋ", "기념으로 한 번 더 가자 트리플킬!", "세 놈 쓸어버렸다 ㅅㅂ", "와 이건 진짜 대단한 트리플킬", "ㅊㅋ 트리플킬 진짜 쩐다!", "기세 무섭다 ㅈㄴ", "셋 연속 처치가 실화냐 ㅋㅋ", "대박 사건이다 트리플킬 미친", "셋을 상대로 완승이네 ㅋㅋ",
@@ -8036,7 +8079,7 @@ local SITUATIONS = {
 		"지금 어느 위치냐 말 좀 해라", "느려도 좋으니 움직여라", "가만있으면 위치 다 털린다 ㅋㅋ", "빨리 전장으로 돌아와 ㅅㅂ!", "판이 너 없이 잘만 돌아간다 ㅋㅋ", "움직여서 적 좀 찾아봐", "멈추면 위험 신호다 ㅅㅂ", "졸았냐? 일단 움직이자 ㅋㅋ",
 		"돌아다니면서 좀 찾자", "지금 가만히 있으면 안 된다고", "적이 가까이 있을 수도 있다 ㅅㅂ", "빨리 움직여서 판 살려 시발", "가만히 있는 시간 존나 길다", "움직여야 기회가 생기지 ㅋㅋ", "잠수 끝내고 전장으로 가 ㅅㅂ",
 	} },
-	hackSuspect = { level = 1, priority = 4, cooldown = 45, cooldown = 45, lines = {
+	hackSuspect = { level = 1, priority = 4, cooldown = 45, lines = {
 		"야 {name} 저거 핵 아니냐 ㅅㅂ", "{name} 벽 뒤에서 어떻게 맞히냐 씨발", "{name} 움직임 존나 이상한데 핵 아님?", "{name} 반응속도 사람이 아닌데 ㅋㅋ", "아니 {name} 또 맞혔어? 존나 수상한데",
 		"방금 {name} 그거 보고도 핵 의심 안 함?", "음 {name} 핵인가? 좀 더 본다 ㅅㅂ", "{name} 시야 밖에서 쏘는데 핵이지 ㅅㅂ", "나만 이상하냐? {name} 핵 같은데",
 		"{name} 또 날 잡네 씨발 핵 의심 중", "슬슬 {name} 핵 쓰는 거 같은데 ㅅㅂ", "{name} 핵이면 ㄹㅇ 존나 짜증나겠다", "아무래도 {name} 핵임 조심해 ㅅㅂ", "{name} 핵 맞냐? 일단 기록해 둔다",
@@ -8289,7 +8332,7 @@ local mounted = false
 if gethui then
 	mounted = pcall(function()
 		gui.Parent = gethui()
-	end)
+	end) and gui.Parent ~= nil
 end
 if not mounted then
 	mounted = pcall(function()
@@ -8467,6 +8510,44 @@ local function fillVars(text, vars)
 	end))
 end
 
+local SOFT_STEMS = {
+	"쩐", "쩔", "쩌", "째", "좋", "꿀", "웃", "못", "빡", "짜", "이득", "이겼",
+	"이김", "이기", "지리", "지림", "지린", "쉽", "아깝", "아쉽", "아파", "멋", "대박", "대단",
+	"잘", "든든", "신나", "신난", "빠르", "빠름", "굿", "무섭", "무서", "위험", "시원", "괜찮",
+	"가볍", "사기", "재밌", "세게", "피곤", "팽팽", "뿌듯", "건방", "올랐", "괴물", "승", "털",
+	"깔끔", "짜릿", "쾌감", "억울", "강해", "강하", "허무", "미워", "미쳤", "망함", "놀랐", "놀람",
+	"쌓", "줄었", "싸운", "환영", "정확", "편하", "구려", "달라", "헛짓", "조심", "티남", "많",
+	"약", "짧", "민폐", "기분", "답답", "별로",
+}
+local SOFT_WORDS = {
+	{ "씨발", "" }, { "시발", "" }, { "씨팔", "" }, { "씨바", "" }, { "ㅆㅂ", "" }, { "ㅅㅂ", "" },
+	{ "존나", "진짜" }, { "졸라", "진짜" }, { "ㅈㄴ", "진짜" }, { "엿같", "별로" }, { "지랄", "난리" }, { "닥쳐", "조용히 해" },
+	{ "꺼져", "저리 가" }, { "새끼", "녀석" }, { "뒤졌", "죽었" }, { "뒤질", "죽을" }, { "뒤져", "죽어" }, { "뒤지", "죽" },
+	{ "미쳤다", "대박이다" }, { "미쳤네", "대박이네" }, { "미쳤어", "대박이야" }, { "미쳤냐", "대박이냐" }, { "미쳤나", "대박인가" }, { "미쳤지", "대박이지" },
+	{ "미쳤고", "대박이고" }, { "미쳤", "대박이" }, { "미친", "대박" }, { "빡쳐", "열받아" }, { "빡치네", "열받네" }, { "빡친다", "열받는다" },
+	{ "빡쳤", "열받았" }, { "빡치게", "열받게" }, { "빡친", "열받은" }, { "빡치", "열받" },
+}
+local function soften(text)
+	for _, stem in ipairs(SOFT_STEMS) do
+		text = string.gsub(text, "개" .. stem, stem)
+	end
+	for _, pair in ipairs(SOFT_WORDS) do
+		text = string.gsub(text, pair[1], pair[2])
+	end
+	text = string.gsub(text, "%s+", " ")
+	text = string.gsub(text, "^[%s,%.!]+", "")
+	text = string.gsub(text, "[%s,]+$", "")
+	text = string.gsub(text, " ([,%.!%?])", "%1")
+	local core = string.gsub(text, "%%s", "x")
+	core = string.gsub(core, "{%w+}", "x")
+	core = string.gsub(core, "[%s%p]", "")
+	for _, mark in ipairs({ "ㅋ", "ㅎ", "ㅠ", "ㅜ" }) do
+		core = string.gsub(core, mark, "")
+	end
+	if (utf8.len(core) or 0) < 2 then return nil end
+	return text
+end
+
 local function say(name, extra, vars)
 	local situation = SITUATIONS[name]
 	if not situation or not P.show then return false end
@@ -8476,8 +8557,18 @@ local function say(name, extra, vars)
 	if now < busyUntil and situation.priority <= busyPriority then return false end
 	local text = pick(name, situation.lines)
 	local follow = lastTopic and FOLLOW_UP[lastTopic]
-	if follow and now - lastTopicAt < 25 and math.random() < 0.35 then
+	if follow and name == lastTopic and now - lastTopicAt < 25 and math.random() < 0.35 then
 		text = follow[math.random(#follow)]
+	end
+	if P.swear == false then
+		local soft = soften(text)
+		local tries = 0
+		while soft == nil and tries < 8 do
+			tries += 1
+			soft = soften(pick(name, situation.lines))
+		end
+		if soft == nil then return false end
+		text = soft
 	end
 	if FOLLOW_UP[name] then
 		lastTopic, lastTopicAt = name, now
@@ -9248,6 +9339,7 @@ env.RivalsPet = {
 	Say = function(_, name, extra) return say(name, extra) end,
 	Situations = SITUATIONS,
 	Decode = b64decode,
+	Soften = soften,
 	ResetPosition = function()
 		P.x, P.y = nil, nil
 		placePet()
