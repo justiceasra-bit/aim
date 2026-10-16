@@ -121,6 +121,7 @@ local function showSplash()
 end
 
 local BOOT_CHECK_AFTER = 8
+local BOOT_RECHECK_AFTER = 20
 
 local function clip(text, count)
 	local ok, cut = pcall(function()
@@ -166,15 +167,25 @@ end
 
 -- a few seconds in: what broke (a section's error, a section that never finished loading, a failed aim check) goes to
 -- the console, the match record and the webhook; nothing is shown on screen
-local function bootReport(boot)
+local function bootReport(boot, final)
 	local env = getgenv()
 	local problems = {}
+	local loading = false
 	for _, name in ipairs(boot.order) do
 		if boot.errors[name] then
 			table.insert(problems, name .. " 오류: " .. boot.errors[name])
 		elseif not boot.done[name] then
-			table.insert(problems, name .. " 로딩이 안 끝남")
+			loading = true
+			if final then table.insert(problems, name .. " 로딩이 안 끝남") end
 		end
+	end
+	-- a first run downloads and decodes its pictures and the game can still be busy: a section that is only slow
+	-- gets until the second check, and only one that is still not done then is reported
+	if loading and not final then
+		task.delay(BOOT_RECHECK_AFTER, function()
+			if getgenv().RivalsBoot == boot then bootReport(boot, true) end
+		end)
+		return problems
 	end
 	local check = env.RivalsCheck
 	if type(check) == "table" and type(check.items) == "table" then
@@ -195,8 +206,32 @@ local function bootReport(boot)
 	return problems
 end
 
+-- started from an auto-execute folder the script can run before the game has loaded: testers' start reports had
+-- LocalPlayer nil (the base, aim and autofire sections failed on it) and the game's own Gun and ClientItem modules
+-- erroring when required that early. Wait for the game, the player, their scripts and a first character
+local function waitForGame()
+	if not game:IsLoaded() then game.Loaded:Wait() end
+	local Players = game:GetService("Players")
+	local player = Players.LocalPlayer
+	while not player do
+		task.wait(0.1)
+		player = Players.LocalPlayer
+	end
+	local scripts = player:WaitForChild("PlayerScripts", 30)
+	if scripts then scripts:WaitForChild("Controllers", 30) end
+	player:WaitForChild("PlayerGui", 30)
+	local began = os.clock()
+	while not player.Character and os.clock() - began < 20 do
+		task.wait(0.1)
+	end
+	local character = player.Character
+	if character then character:WaitForChild("HumanoidRootPart", 10) end
+end
+
 local runId = (getgenv().RivalsRunId or 0) + 1
 getgenv().RivalsRunId = runId
+pcall(waitForGame)
+if getgenv().RivalsRunId ~= runId then return end
 if not pcall(showSplash) then
 	pcall(function()
 		local leftover = getgenv().RivalsSplash
@@ -1064,10 +1099,12 @@ end
 env.RivalsEvent = event
 
 local function note(name, ok, detail)
-    table.insert(Check.items, { name = name, ok = ok and true or false, detail = detail })
+    local item = { name = name, ok = ok and true or false, detail = detail }
+    table.insert(Check.items, item)
     if not ok then
         Check.ok = false
     end
+    return item
 end
 
 local function loadModule(name, getter)
@@ -1547,6 +1584,9 @@ do
 
     -- spot lists sit around the target's body, or (anchor = 'head') right on its head hitbox without its turn
     local function anchorFor(list, targetRoot, head)
+        if list and list.anchor == 'flat' then
+            return CFrame.new(targetRoot.Position)
+        end
         if list and list.anchor == 'head' then
             local character = targetRoot.Parent
             local box = character and character:FindFirstChild('HitboxHead')
@@ -1563,6 +1603,25 @@ do
         local state = env.RivalsTargetState
         if not player or not state then return false end
         return state:Blocked(player, position + Vector3.new(0, 1.75, 0), self.blockWeapon) ~= nil
+    end
+
+    -- a target under a roof or in a corner left no listed spot safe: 12% of still windows (1.1% of moving ones) went
+    -- out with the body unmoved and hit about 25%. The last try is the open air between the target and our own body
+    local function approachList(targetRoot, rootPart)
+        local toward = rootPart.Position - targetRoot.Position
+        local flat = Vector3.new(toward.X, 0, toward.Z)
+        if flat.Magnitude < 1 then return nil end
+        local forward = flat.Unit
+        local side = Vector3.new(-forward.Z, 0, forward.X)
+        local list = { anchor = 'flat' }
+        for _, distance in ipairs({ 4, 7, 10 }) do
+            for _, lateral in ipairs({ 0, 3, -3 }) do
+                for _, lift in ipairs({ 0, 2.5 }) do
+                    table.insert(list, CFrame.new(forward * distance + side * lateral + Vector3.new(0, lift, 0)))
+                end
+            end
+        end
+        return list
     end
 
     function DesyncController:Pick(targetRoot, head, rootPart)
@@ -1600,6 +1659,20 @@ do
                             firstSafe, firstOffset, firstList, firstExact = candidate, offset, list, exact == true
                         end
                     end
+                end
+            end
+        end
+        local approach = v65('approach') and approachList(targetRoot, rootPart) or nil
+        if approach then
+            local base = anchorFor(approach, targetRoot, head)
+            for _, offset in ipairs(approach) do
+                local candidate = base * offset
+                local safe, exact = self:IsSafe(candidate.Position, rootPart)
+                if safe and not blockedSpot(self, candidate.Position) and self:HasLine(candidate.Position, head) then
+                    self.pick = { offset = offset, list = approach, line = head ~= nil, at = now }
+                    self.pickExact = exact == true
+                    self.approached = (self.approached or 0) + 1
+                    return candidate, offset
                 end
             end
         end
@@ -1689,6 +1762,7 @@ do
         self.active = true
         self.pick = nil
         self.placedAt = nil
+        self.prewarmed = nil
         self.startTarget = target
         self.startedAt = os.clock()
         self.expireAt = self.startedAt + 0.6
@@ -1871,9 +1945,6 @@ do
                 local deflectEnd = field(equipped, '_deflect_cooldown')
                 local deflectCooldown = info.DeflectCooldown
                 state.deflecting = type(deflectEnd) == 'number' and type(deflectCooldown) == 'number' and now < deflectEnd - deflectCooldown
-                if state.deflecting then
-                    state.deflectUntil = deflectEnd - deflectCooldown
-                end
                 local attackEnd = field(equipped, '_attack_cooldown')
                 local attacking = type(attackEnd) == 'number' and now < attackEnd
                 state.riotFront = riotEquipped and not attacking
@@ -1953,12 +2024,6 @@ do
         if state.riotFront and not SHIELD_IMMUNE[weaponName] and dot < FRONT_BLOCK_DOT then return 'front' end
         if state.riotBack and not SHIELD_IMMUNE[weaponName] and dot > BACK_BLOCK_DOT then return 'back' end
         return nil
-    end
-
-    function TargetState:DeflectLeft(player, weaponName)
-        local state = self:Read(player)
-        if not state or not state.deflecting or not state.deflectUntil or DEFLECT_IMMUNE[weaponName] then return nil end
-        return state.deflectUntil - gameClock()
     end
 
     function TargetState:LookDot(player, origin)
@@ -2372,6 +2437,23 @@ do
         return (arm.hits + 1) / (arm.finished + 2)
     end
 
+    function Tuner:BestOther(name, weapon, exclude)
+        if weapon then name = self:Scoped(name, weapon) end
+        local dim = self.dims[name]
+        if not dim then return nil end
+        local best, bestScore = nil, -1
+        for _, arm in ipairs(dim.order) do
+            if arm ~= exclude then
+                local s = score(dim.arms[arm])
+                if s > bestScore then
+                    best, bestScore = arm, s
+                end
+            end
+        end
+        if best then dim.arms[best].assigned += 1 end
+        return best
+    end
+
     function Tuner:Best(name)
         local dim = self.dims[name]
         local best, bestScore = dim.order[1], -1
@@ -2746,7 +2828,7 @@ env.RivalsStats = {
     shapeCount = 0,
     relocated = 0,
     heldShots = 0,
-    warmShots = 0,
+    warms = 0,
     warmWait = 0,
     windows = 0,
     windowHits = 0,
@@ -2757,6 +2839,8 @@ env.RivalsStats = {
     maxDamage = setmetatable({}, { __mode = 'k' }),
     lateWatch = setmetatable({}, { __mode = 'k' }),
     track = setmetatable({}, { __mode = 'k' }),
+    targetWindows = setmetatable({}, { __mode = 'k' }),
+    lastHitAt = setmetatable({}, { __mode = 'k' }),
 }
 do
     local Stats = env.RivalsStats
@@ -2778,7 +2862,7 @@ do
     end
     local LOG_SIZE = 5000
     local CONSOLE_LINES = 30
-    local SCRIPT_CHECKPOINT = 72
+    local SCRIPT_CHECKPOINT = 75
     local SCRIPT_VERSION = '체크포인트 ' .. SCRIPT_CHECKPOINT
     env.RivalsVersion = SCRIPT_VERSION
 
@@ -2860,6 +2944,13 @@ do
             window.recorded = true
             info.lead = true
             self.windows += 1
+            local list = self.targetWindows[targetPlayer]
+            if not list then
+                list = {}
+                self.targetWindows[targetPlayer] = list
+            end
+            table.insert(list, { t = record.t, choices = window.choices })
+            if #list > 12 then table.remove(list, 1) end
         end
         self.shots += 1
         table.insert(self.pending, record)
@@ -2876,6 +2967,9 @@ do
         if hit then
             self.hits += 1
             self.lastHit = { target = record.target, t = os.clock() }
+            if record.target then
+                self.lastHitAt[record.target] = math.max(self.lastHitAt[record.target] or -math.huge, record.t)
+            end
             record.damage = damage
             record.delay = self.clock() - record.t
             if damage and record.weapon ~= nil then
@@ -2893,11 +2987,15 @@ do
                 end
                 credit = killed and 1 or math.max(0.1, ratio * ratio)
             end
-            -- a headshot does the weapon's CriticalDamage; damage far above it is several hits summed, far below it is falloff
+            -- a head hit does the weapon's CriticalDamage and a body hit its ShootDamage; anything else is falloff, a
+            -- shotgun's pellets or hits summed, and says nothing (the shotgun's 31-105 counted as body shots: 0/3 heads)
             local gun = record.info and record.info.weapon
             local crit = type(gun) == 'table' and tonumber(gun.CriticalDamage) or nil
-            if damage and crit and crit > 0 and damage >= 0.5 * crit and damage <= 1.6 * crit then
-                local head = damage >= 0.95 * crit
+            local body = type(gun) == 'table' and tonumber(gun.ShootDamage) or nil
+            local isHead = damage and crit and crit > 0 and math.abs(damage - crit) <= 0.05 * crit
+            local isBody = damage and crit and body and body > 0 and body < crit and math.abs(damage - body) <= 0.05 * body
+            if isHead or isBody then
+                local head = isHead and true or false
                 self.headTotal += 1
                 if head then self.headHits += 1 end
                 local name = record.info.weaponName
@@ -2936,18 +3034,43 @@ do
         if counted and record.info.arms and not record.info.invincible and not record.info.scanned and record.info.moved ~= false then
             local weaponName = record.info.weaponName
             local ctx = window and window.ctx
+            local modes = window and window.modes
             for dimension, arm in pairs(record.info.arms) do
-                env.RivalsTuner:Credit(dimension, arm, credit)
-                if weaponName then
-                    local scoped = dimension .. '@' .. weaponName
-                    if ctx and CTX_DIMS[dimension] then scoped = scoped .. ctx end
-                    env.RivalsTuner:Credit(scoped, arm, credit)
+                -- a choice swapped away from the one that kept missing proves nothing about that arm in general
+                if not (modes and modes[dimension] == 'switch') then
+                    env.RivalsTuner:Credit(dimension, arm, credit)
+                    if weaponName then
+                        local scoped = dimension .. '@' .. weaponName
+                        if ctx and CTX_DIMS[dimension] then scoped = scoped .. ctx end
+                        env.RivalsTuner:Credit(scoped, arm, credit)
+                    end
                 end
             end
         end
         if env.RivalsTargetState then
             env.RivalsTargetState:Settle(record.info, hit)
         end
+    end
+
+    -- two or more windows at this target that should have shown a hit by now (0.3s, or ping + 0.15s: 95% of
+    -- hits show within 0.27s) and did not, since the last hit: the choices of the latest of them, else nil
+    function Stats:MissRun(target)
+        local list = self.targetWindows[target]
+        if not list then return nil end
+        local now = self.clock()
+        local wait = math.max(0.3, (self:Ping() or 100) / 1000 + 0.15)
+        local lastHit = self.lastHitAt[target] or -math.huge
+        local missed, latest = 0, nil
+        for i = #list, 1, -1 do
+            local entry = list[i]
+            if entry.t <= lastHit or now - entry.t > 3 then break end
+            if now - entry.t >= wait then
+                missed += 1
+                latest = latest or entry
+            end
+        end
+        if missed >= 2 then return latest.choices end
+        return nil
     end
 
     function Stats:Skip(reason, shape)
@@ -2965,6 +3088,17 @@ do
     end
 
     function Stats:CheckHook()
+        -- a tester's match kept 'never called' after 315 early presses although the hook ran 269 times later on
+        local warned = self.hookNote
+        if warned and not warned.ok and self.hookCalls > 0 then
+            warned.ok = true
+            warned.detail = tostring(warned.detail) .. ', 그 뒤로는 불림'
+            local allOk = true
+            for _, item in ipairs(Check.items) do
+                if not item.ok then allOk = false end
+            end
+            Check.ok = allOk
+        end
         if self.hookWarned or self.hookCalls > 0 then return end
         local fire = env.RivalsFire
         if not fire or fire.presses < 5 or not fire.firstPress then return end
@@ -2973,7 +3107,7 @@ do
 
         self.hookWarned = true
         local text = '마우스를 ' .. fire.presses .. '번 눌렀는데 한 번도 안 불렸다'
-        note('StartShooting 후킹이 불림', false, text)
+        self.hookNote = note('StartShooting 후킹이 불림', false, text)
         warn('[rivals] StartShooting 후킹이 안 불린다: ' .. text .. '. 게임이 다른 경로로 쏘거나 후킹이 덮어씌워졌을 수 있다')
     end
 
@@ -3223,7 +3357,7 @@ do
         end
         table.insert(lines, string.format('훅: 호출 %d, 에임 적용 %d  (대상 없음 %d, 에임 꺼짐 %d, 데이터 모양 이상 %d)',
             self.hookCalls, self.shots, self.skips.noTarget or 0, self.skips.rageOff or 0, self.skips.payload or 0) .. (self.heldShots > 0 and string.format('  첫 샷 대기 %d', self.heldShots) or '')
-            .. (self.warmShots > 0 and string.format('  디싱크 자리 잡기 대기 %d번(평균 %.2f초)', self.warmShots, self.warmWait / self.warmShots) or ''))
+            .. (self.warms > 0 and string.format('  디싱크 데우기 %d번(평균 %.2f초)', self.warms, self.warmWait / self.warms) or ''))
         if self.hookErrors > 0 then
             local kinds = {}
             for _, entry in ipairs(self.hookErrorList) do
@@ -3533,6 +3667,13 @@ do
             if info.shield then
                 arms = arms .. '  방패 돌아감=' .. (info.shield == 'front' and '앞' or info.shield == 'back' and '뒤' or '반사')
             end
+            if info.warm then
+                arms = arms .. '  데워진 자리 그대로'
+            end
+            local shotWindow = info.window
+            if type(shotWindow) == 'table' and shotWindow.switchTried then
+                arms = arms .. (shotWindow.switchFrom and '  연속빗나감 바꿈=1' or '  연속빗나감 바꿈=0')
+            end
             if info.control then
                 arms = arms .. '  대조=1'
             end
@@ -3583,12 +3724,12 @@ do
         if #rows > 0 then
             -- machine-readable: one line per window, the same columns every match
             table.insert(lines, string.format('창 표 %d개 (CSV, 창마다 한 줄)', #rows))
-            table.insert(lines, 'id,t,target,result,requests,damage,dist,speed,ping,weapon,kind,desync,origin,direct,point,hitpart,facing,reach,reachNear,flags,pv,sf,st,md,hp,hh,cr,ms,dO,dP,od,pd,pw,dh,xp,ctx,fr,ox,oy,oz,pa,bl,da,wu,hb,hy')
+            table.insert(lines, 'id,t,target,result,requests,damage,dist,speed,ping,weapon,kind,desync,origin,direct,point,hitpart,facing,reach,reachNear,flags,pv,sf,st,md,hp,hh,cr,ms,dO,dP,od,pd,pw,dh,xp,ctx,fr,ox,oy,oz,pa,bl,da,wu,hb,hy,sw')
             for _, row in ipairs(rows) do
                 local info, arms = row.info, row.info.arms or {}
                 local kind = info.body and 'body' or info.escape and 'escape' or info.direct and (info.visible and 'visible' or 'direct') or (arms.desync and 'wall' or 'other')
                 local flags = {}
-                for _, flag in ipairs({ 'silent', 'meleeSafe', 'edge', 'invincible', 'flank', 'control', 'retargeted', 'exact' }) do
+                for _, flag in ipairs({ 'silent', 'meleeSafe', 'edge', 'invincible', 'flank', 'control', 'retargeted', 'exact', 'warm', 'approach', 'prewarm' }) do
                     if info[flag] then table.insert(flags, flag) end
                 end
                 if info.block then table.insert(flags, 'block=' .. tostring(info.block)) end
@@ -3612,9 +3753,10 @@ do
                     csvFixed(x.pv, 1), csvFixed(x.sf, 1), tostring(x.st or ''), csvFixed(x.md, 2), csvFixed(x.hp, 0), csvFixed(x.hh, 2),
                     x.cr == nil and '' or (x.cr and '1' or '0'), csvFixed(x.ms, 1), csvFixed(x.dO, 2), csvFixed(x.dP, 2), csvFixed(x.od, 1), csvFixed(x.pd, 1),
                     csvFixed(x.pw and x.pw * 1000, 0), csvFixed(x.dh and x.dh * 1000, 0), table.concat(explored, '|'),
-                    type(window) == 'table' and window.ctx ~= nil and (window.ctx == '#still' and 'still' or 'moving') or '',
+                    type(window) == 'table' and window.ctx ~= nil and (window.ctx == '#still' and 'still' or window.ctx == '#crouch' and 'crouch' or 'moving') or '',
                     tostring(x.fr or ''), csvFixed(x.ox, 2), csvFixed(x.oy, 2), csvFixed(x.oz, 2), tostring(x.pa or ''), tostring(x.bl or ''),
                     csvFixed(x.da and x.da * 1000, 0), csvFixed(x.wu and x.wu * 1000, 0), csvFixed(x.hb, 2), csvFixed(x.hy, 2),
+                    type(window) == 'table' and window.switchTried and (window.switchFrom and '1' or '0') or '',
                 }, ','))
             end
         end
@@ -3948,11 +4090,15 @@ local NEAR_DISTANCE = 4
 local REACH_MIN = 50
 local HOLD_FRAMES = 6
 
--- the server takes about 0.2s to see the body at a new desync spot: in 1333 matches a wall shot fired in the first
--- 0.2s after the desync started hit 9-11% of requests (39% of windows), one fired 0.25s on hit 31-38% (66-73% of
--- windows), at every ping and distance. So the first shot waits out that time, and the spot is kept for a weapon
--- cycle after a shot instead of 0.15s, so the next shot does not start over
-local WARM_UP = 0.24
+-- the server takes a moment to see the body at a new desync spot: unheld shots fired 0.25-0.3s after the body was
+-- placed hit 50-61%, from 0.3s on 70-77% (checkpoint 72), and the spot is kept for a weapon cycle after a shot instead
+-- of 0.15s so the next shot does not start over. Only a gun with a cycle of SLOW_CYCLE or more waits for it (see Aim):
+-- the autofire keeps its trigger up until a spot is WARM_UP old (at most PREWARM_MAX after it started), and a trigger
+-- down PREWARM_DRY past the gun's cycle without a shot is a reload: no spot is kept for it until the gun fires again
+local WARM_UP = 0.3
+local SLOW_CYCLE = 0.25
+local PREWARM_MAX = 0.6
+local PREWARM_DRY = 0.4
 local LINGER_MIN, LINGER_MAX, LINGER_EXTRA = 0.35, 0.8, 0.2
 
 -- true while the anti-aim (still running) had the replicated body away from the real one on its last frame
@@ -3990,6 +4136,10 @@ local function shotOrigin(arm, targetHead, targetRoot)
 end
 
 local ShotWindow = { count = 0 }
+-- after two windows in a row at one target missed, half the next windows (picked at random, the rest kept as the
+-- comparison) swap these choices away from what those windows used: in checkpoint 64 a changed choice after a
+-- miss streak hit 26.3% against 24.8% kept the same, small and not yet sure, so it is measured as it runs
+local SWITCH_DIMS = { hitpart = true, origin = true, point = true, direct = true }
 env.RivalsShotWindow = ShotWindow
 do
     local function realCycle(controller)
@@ -4031,6 +4181,13 @@ do
             if weapon and window.ctx and CTX_DIMS[name] then weapon = weapon .. window.ctx end
             local mode
             choice, mode = env.RivalsTuner:Choose(name, weapon)
+            local from = window.switchFrom
+            if from and SWITCH_DIMS[name] and from[name] ~= nil and choice == from[name] then
+                local other = env.RivalsTuner:BestOther(name, weapon, choice)
+                if other then
+                    choice, mode = other, 'switch'
+                end
+            end
             window.choices[name] = choice
             window.modes = window.modes or {}
             window.modes[name] = mode
@@ -4134,12 +4291,16 @@ do
         env.RivalsShotAt = os.clock()
 
         -- the anti-aim moved the replicated body last frame: a shot from there is thrown away, so let the real body go out first
+        local hookWait = nil
         if antiAimMoved() then
             env.RivalsStats.heldShots += 1
+            local began = os.clock()
             for _ = 1, HOLD_FRAMES do
+                self.holdUntil = math.max(self.holdUntil or 0, os.clock() + 0.05)
                 task.wait()
                 if not antiAimMoved() then break end
             end
+            hookWait = os.clock() - began
         end
 
         local window = ShotWindow:Enter(controller, os.clock())
@@ -4172,15 +4333,7 @@ do
         pcall(function() weaponName = controller.Name end)
         local projectile = false
         pcall(function() projectile = controller.Info.IsProjectile == true end)
-        local held = nil
-        if v65('deflectHold') then
-            local left = env.RivalsTargetState:DeflectLeft(targetPlayer, weaponName)
-            if left and left > 0 and left <= 0.4 then
-                local began = os.clock()
-                task.wait(left + 0.03)
-                held = os.clock() - began
-            end
-        end
+        local slowGun = ShotWindow.RealCycle(controller) >= SLOW_CYCLE
         local visible, inRange, distance, seenPoint = TargetController:Judge(targetPlayer)
         local pinned = false
         if silent and not visible then
@@ -4221,11 +4374,19 @@ do
             local camera = currentCamera()
             shieldSide = camera and env.RivalsTargetState:Blocked(targetPlayer, camera.CFrame.Position, weaponName) or nil
         end
-        local desyncArm = (visible and reachArm ~= 'move' and not escape and not shieldSide) and 'none' or self:ArmFor(targetPlayer)
+        -- a spot that has stood the warm-up for this target shoots better than the camera (68.5-70.7% against 66-68%,
+        -- 9-23% more damage, and 63% against 45% when only part of the head shows): keep it instead of dropping it
+        local warmReuse = false
+        local warmSince = DesyncController.placedAt
+        if rage and visible and not escape and v65('warmReuse') and DesyncController.active and DesyncController.startTarget == targetPlayer
+            and DesyncController.placed ~= nil and warmSince ~= nil and os.clock() - warmSince >= WARM_UP then
+            warmReuse = true
+        end
+        local desyncArm = (visible and reachArm ~= 'move' and not escape and not shieldSide and not warmReuse) and 'none' or self:ArmFor(targetPlayer)
         DesyncController.avoidBlock = (rage and v65('shieldMove')) and targetPlayer or nil
         DesyncController.blockWeapon = weaponName
         local meleeSafe = false
-        local waited, warmed = nil, nil
+        local warmed = nil
         if desyncArm == 'none' then
             if DesyncController.active then
                 DesyncController:Stop('visible')
@@ -4244,34 +4405,36 @@ do
                 DesyncController.offset = spots[1]
                 DesyncController:Start(targetPlayer)
             end
+            -- the body needs a frame at its spot before a shot names it. A request held in here goes out together
+            -- with the ones pressed while it waited, and the server takes one of them: in checkpoint 72, 503 windows
+            -- sent within 5ms of the one before hit 14%, nearly all from the warm-up hold of fast guns. So the
+            -- autofire stops pressing while this waits
             local ready = (DesyncController.startedAt or 0) + 0.1 - os.clock()
             if ready > 0 then
+                self.holdUntil = math.max(self.holdUntil or 0, os.clock() + ready + 0.02)
                 task.wait(ready)
+                hookWait = (hookWait or 0) + ready
             end
-            if v65('placeWait') and DesyncController.placed == nil then
-                local failed = DesyncController.failedTarget == targetPlayer and os.clock() - (DesyncController.failedAt or -math.huge) < 1
-                if not failed then
-                    local began = os.clock()
-                    while DesyncController.active and DesyncController.placed == nil and os.clock() - began < 0.12 do
-                        task.wait()
-                    end
+            -- a slow gun loses nothing by also waiting for the server to see the spot: it would not fire again before
+            -- then. Its first windows held so hit 67.5% behind walls and 84% in sight in checkpoint 72 (the Sniper 70%
+            -- against 45% cold). A fast gun shoots at once: its next windows would come during the wait, and cold
+            -- ones still hit 30-40% where waiting hits nothing (an escape cannot wait either)
+            if slowGun and not escape and v65('slowWarm') then
+                local began = os.clock()
+                local waited = nil
+                while DesyncController.active and os.clock() - began < WARM_UP do
+                    local placedAt = DesyncController.placedAt
+                    if placedAt and os.clock() - placedAt >= WARM_UP then break end
+                    DesyncController.expireAt = math.max(DesyncController.expireAt or 0, os.clock() + 0.6)
+                    self.holdUntil = math.max(self.holdUntil or 0, os.clock() + 0.05)
+                    task.wait()
                     waited = os.clock() - began
-                    if DesyncController.placed == nil then
-                        DesyncController.failedTarget, DesyncController.failedAt = targetPlayer, os.clock()
-                    end
                 end
-            end
-            -- an escape cannot wait; every other desync shot goes out once the server can see the spot
-            local placedAt = DesyncController.placedAt
-            if v65('warm') and not escape and DesyncController.active and placedAt then
-                local left = placedAt + WARM_UP - os.clock()
-                if left > 0 then
-                    DesyncController.expireAt = math.max(DesyncController.expireAt or 0, os.clock() + left + 0.6)
-                    local began = os.clock()
-                    task.wait(math.min(left, WARM_UP))
-                    warmed = os.clock() - began
-                    env.RivalsStats.warmShots += 1
-                    env.RivalsStats.warmWait += warmed
+                if waited then
+                    warmed = waited
+                    hookWait = (hookWait or 0) + waited
+                    env.RivalsStats.warms += 1
+                    env.RivalsStats.warmWait += waited
                 end
             end
         end
@@ -4317,15 +4480,34 @@ do
 
         local targetRoot = character:FindFirstChild('HumanoidRootPart')
         if window.ctx == nil and v65('ctx') and targetRoot then
-            window.ctx = targetRoot.AssemblyLinearVelocity.Magnitude < STILL_SPEED and '#still' or ''
+            -- a crouched target hit 26.6% (248 windows, head 0.48 above the root against 1.38 standing), still or not:
+            -- its own context lets the tuner find which part and point land on it
+            if v65('crouchCtx') and env.RivalsTargetState:Crouching(targetPlayer) then
+                window.ctx = '#crouch'
+            else
+                window.ctx = targetRoot.AssemblyLinearVelocity.Magnitude < STILL_SPEED and '#still' or ''
+            end
+        end
+        if window.switchFrom == nil then
+            window.switchFrom = false
+            local from = v65('switch') and env.RivalsStats:MissRun(targetPlayer) or nil
+            if from then
+                window.switchTried = true
+                if env.RivalsTuner.random() < 0.5 then window.switchFrom = from end
+            end
         end
         local pointArm = choose('point')
 
         local shieldMove = shieldSide ~= nil and desyncArm ~= 'none'
+        warmReuse = warmReuse and desyncArm ~= 'none'
+        -- with a melee holder the body waits 12 studs out, and an origin named near the target hit 9-10 points less
+        -- from there (clear 62.7%, under 63.6%) than the body itself (67.4%, 70% head shots against 38-53%)
+        local meleeShooter = meleeSafe and desyncArm ~= 'none' and v65('meleeShooter')
+        local forcedShooter = shieldMove or warmReuse or meleeShooter
         local originArm
         if retargeted then
             originArm = 'camera'
-        elseif shieldMove or (direct and (reachArm == 'move' or escape)) then
+        elseif forcedShooter or (direct and (reachArm == 'move' or escape)) then
             originArm = 'shooter'
         elseif direct then
             originArm = choose('direct')
@@ -4362,7 +4544,7 @@ do
                 end
             end
         end
-        local fromCamera = direct and reachArm ~= 'move' and not escape and not shieldMove
+        local fromCamera = direct and reachArm ~= 'move' and not escape and not forcedShooter
         local basePos = (fromCamera and not flank) and seenPoint or sightPoint(shootingPos, targetHead)
         local partArm = choose('hitpart')
         local headBox = nil
@@ -4426,10 +4608,12 @@ do
         cameraData[utf8.char(2)] = hitPart
         cameraData[utf8.char(3)] = Utility:EncodeCFrame(shootingOffset)
 
-        local moved, exact = nil, nil
+        local moved, exact, approached = nil, nil, nil
         if desyncArm ~= 'none' then
             moved = DesyncController.active == true and DesyncController.placed ~= nil
             exact = (moved and DesyncController.placedExact == true) or nil
+            local pick = moved and DesyncController.pick or nil
+            approached = (pick and pick.list and pick.list.anchor == 'flat') or nil
         end
         local arms = { point = pointArm, facing = facingArm, hitpart = partArm }
         if reachDim then
@@ -4446,14 +4630,28 @@ do
             arms.direct = nil
             arms.flankReach = flankArm
         end
-        if shieldMove then
-            -- the spot and the origin were forced round the shield: no choice of the tuner's made this shot
-            arms.origin, arms.direct, arms.desync = nil, nil, nil
-            if reachDim then arms[reachDim] = nil end
+        if forcedShooter then
+            -- the spot and the origin were forced (round a shield, a warm spot kept, a melee holder's distance):
+            -- no choice of the tuner's made this shot
+            arms.origin, arms.direct = nil, nil
+            if shieldMove or warmReuse then
+                arms.desync = nil
+                if reachDim then arms[reachDim] = nil end
+            end
         end
+        if meleeSafe then
+            -- the melee holder's spot list stood in for the desync arm's own spots
+            arms.desync = nil
+        end
+        local prewarmHeld = nil
+        if self.prewarmDoneAt and os.clock() - self.prewarmDoneAt < 0.25 then
+            prewarmHeld = self.prewarmHeld
+            self.prewarmDoneAt = nil
+        end
+        local prewarmed = (desyncArm ~= 'none' and DesyncController.active and DesyncController.prewarmed) or nil
         local extra = nil
         if v65('log') then
-            extra = { pw = waited, dh = held, wu = warmed, fr = flankArm, pa = projectile and env.RivalsStats.projArm or nil, bl = ballistic and '1' or nil }
+            extra = { pw = prewarmHeld, dh = hookWait, wu = warmed, fr = flankArm, pa = projectile and env.RivalsStats.projArm or nil, bl = ballistic and '1' or nil }
             if scanApplied then
                 extra.ox, extra.oy, extra.oz = scanApplied.X, scanApplied.Y, scanApplied.Z
             end
@@ -4481,7 +4679,7 @@ do
             end)
         end
         local weapon = type(controller) == 'table' and controller.Info or controller
-        env.RivalsStats:Record(targetPlayer, { arms = arms, moved = moved, exact = exact, direct = direct or nil, visible = visible or nil, retargeted = retargeted or nil, edge = edge or nil, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, silent = silent or nil, meleeSafe = meleeSafe or nil, escape = escape or nil, invincible = targetState:IsInvincible(targetPlayer) or nil, block = block, flank = flank, control = control, shield = shieldMove and shieldSide or nil, window = window, x = extra, scanned = scanApplied and true or nil })
+        env.RivalsStats:Record(targetPlayer, { arms = arms, moved = moved, exact = exact, direct = direct or nil, visible = visible or nil, retargeted = retargeted or nil, edge = edge or nil, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, silent = silent or nil, meleeSafe = meleeSafe or nil, escape = escape or nil, invincible = targetState:IsInvincible(targetPlayer) or nil, block = block, flank = flank, control = control, shield = shieldMove and shieldSide or nil, warm = warmReuse or nil, approach = approached or nil, prewarm = prewarmed, window = window, x = extra, scanned = scanApplied and true or nil })
 
         self:ArmCleanup((desyncArm ~= 'none' and v65('linger')) and lingerFor(controller) or nil)
     end
@@ -4505,6 +4703,77 @@ do
         env.RivalsStats:Record(targetPlayer, { direct = true, visible = true, silent = true, body = true, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, window = window })
     end
 
+    -- the autofire asks this before it presses. With a slow gun at a target behind a wall the body goes to its desync
+    -- spot first, and the trigger stays up until the server has had WARM_UP to see it there: the shot then goes out at
+    -- once from a warm spot instead of waiting in the hook. The spot is kept while the gun cycles (a Sniper's 1.6s is
+    -- longer than any linger, so each shot would start a cold one) until the trigger has been down a while with no
+    -- shot: a reload, when the body would only wait next to the target
+    function WallbangController:Prewarm()
+        if not self.active then return false end
+        local now = os.clock()
+        local lastCall = self.prewarmCall
+        self.prewarmCall = now
+        if lastCall == nil or now - lastCall > 0.25 then
+            self.pressFrom, self.prewarmFrom = nil, nil
+        elseif self.pressFrom and (env.RivalsShotAt or -math.huge) >= self.pressFrom then
+            self.pressFrom = nil
+        end
+        -- a request is waiting inside the hook: one pressed now would go out together with it
+        if now < (self.holdUntil or 0) then return true end
+        local function press()
+            local from = self.prewarmFrom
+            if from then
+                self.prewarmFrom = nil
+                self.prewarmHeld, self.prewarmDoneAt = now - from, now
+                env.RivalsStats.warms += 1
+                env.RivalsStats.warmWait += now - from
+            end
+            self.pressFrom = self.pressFrom or now
+            return false
+        end
+        if not on('rage') or not v65('prewarm') then return press() end
+        local target = TargetController.target
+        local character = target and target.Character
+        if not character or not character:FindFirstChild('HumanoidRootPart') or TargetController.targetVisible ~= false or TargetController.targetInRange ~= true then
+            return press()
+        end
+        local item = env.RivalsTargetState:Equipped(LocalPlayer)
+        local isGun, weaponName = false, nil
+        if item then
+            pcall(function()
+                isGun = type(item.StartShooting) == 'function'
+                weaponName = item.Name
+            end)
+        end
+        if not isGun then return press() end
+        local cycle = ShotWindow.RealCycle(item)
+        if not (cycle >= SLOW_CYCLE) then return press() end
+        if self.pressFrom and now - self.pressFrom > cycle + PREWARM_DRY then return press() end
+        local desync = DesyncController
+        if not desync.active or desync.startTarget ~= target then
+            local list = env.RivalsTargetState:HoldsMelee(target) and 'melee' or self:ArmFor(target)
+            local spots = DESYNC_CANDIDATES[list]
+            if not spots then return press() end
+            desync.offsets, desync.fallback, desync.offset = spots, DESYNC_FALLBACK[list], spots[1]
+            desync.avoidBlock = v65('shieldMove') and target or nil
+            desync.blockWeapon = weaponName
+            desync:Start(target)
+            desync.prewarmed = true
+        end
+        desync.expireAt = math.max(desync.expireAt or 0, now + 0.6)
+        if self.desyncCleanup then
+            pcall(task.cancel, self.desyncCleanup)
+            self.desyncCleanup = nil
+        end
+        local placedAt = desync.placedAt
+        if now - (desync.startedAt or now) >= PREWARM_MAX or (placedAt and now - placedAt >= WARM_UP) then
+            return press()
+        end
+        self.prewarmFrom = self.prewarmFrom or now
+        self.pressFrom = nil
+        return true
+    end
+
     function WallbangController:Stop()
         self.active = false
         if GunItem and self.startShootingRef then
@@ -4517,8 +4786,12 @@ do
     end
 
     WallbangController:init()
+    env.RivalsPrewarm = function()
+        return WallbangController:Prewarm()
+    end
 end
 env.RivalsAimUnload = function()
+    env.RivalsPrewarm = nil
     if env.RivalsTuner and env.RivalsTuner.Save then
         env.RivalsTuner:Save()
     end
@@ -5137,6 +5410,17 @@ local function tick()
 		setHeld(false)
 		trainStart = nil
 		return
+	end
+
+	-- a slow gun at a target behind a wall: the aim puts the body at its desync spot first and the trigger stays up
+	-- until the server can see it there; a request still waiting inside the hook keeps it up too (see Prewarm in the aim)
+	if not melee and env.RivalsPrewarm then
+		local ok, wait = pcall(env.RivalsPrewarm)
+		if ok and wait then
+			setHeld(false)
+			trainStart = nil
+			return
+		end
 	end
 
 	local lastShot = env.RivalsLastShotAt
