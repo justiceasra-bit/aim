@@ -2862,7 +2862,7 @@ do
     end
     local LOG_SIZE = 5000
     local CONSOLE_LINES = 30
-    local SCRIPT_CHECKPOINT = 75
+    local SCRIPT_CHECKPOINT = 76
     local SCRIPT_VERSION = '체크포인트 ' .. SCRIPT_CHECKPOINT
     env.RivalsVersion = SCRIPT_VERSION
 
@@ -4092,11 +4092,15 @@ local HOLD_FRAMES = 6
 
 -- the server takes a moment to see the body at a new desync spot: unheld shots fired 0.25-0.3s after the body was
 -- placed hit 50-61%, from 0.3s on 70-77% (checkpoint 72), and the spot is kept for a weapon cycle after a shot instead
--- of 0.15s so the next shot does not start over. Only a gun with a cycle of SLOW_CYCLE or more waits for it (see Aim):
--- the autofire keeps its trigger up until a spot is WARM_UP old (at most PREWARM_MAX after it started), and a trigger
--- down PREWARM_DRY past the gun's cycle without a shot is a reload: no spot is kept for it until the gun fires again
+-- of 0.15s so the next shot does not start over. A gun with a cycle of SLOW_CYCLE or more waits for it (see Aim), a
+-- faster one only FAST_WARM: the autofire keeps its trigger up until a spot is that old (at most PREWARM_MAX after it
+-- started), and a trigger down PREWARM_DRY past the gun's cycle without a shot is a reload: no spot is kept for it
+-- until the gun fires again
 local WARM_UP = 0.3
 local SLOW_CYCLE = 0.25
+-- without the bunching (checkpoint 75), a fast gun's windows behind walls hit 22-35% at 0.06-0.11s after the body was
+-- placed and 57-72% from 0.12-0.13s on (in sight 41-48% against 71-80%): its first shot waits that much, under one cycle
+local FAST_WARM = 0.13
 local PREWARM_MAX = 0.6
 local PREWARM_DRY = 0.4
 local LINGER_MIN, LINGER_MAX, LINGER_EXTRA = 0.35, 0.8, 0.2
@@ -4415,16 +4419,17 @@ do
                 task.wait(ready)
                 hookWait = (hookWait or 0) + ready
             end
-            -- a slow gun loses nothing by also waiting for the server to see the spot: it would not fire again before
-            -- then. Its first windows held so hit 67.5% behind walls and 84% in sight in checkpoint 72 (the Sniper 70%
-            -- against 45% cold). A fast gun shoots at once: its next windows would come during the wait, and cold
-            -- ones still hit 30-40% where waiting hits nothing (an escape cannot wait either)
-            if slowGun and not escape and v65('slowWarm') then
+            -- then the shot waits for the server to see the spot. A slow gun waits WARM_UP: it would not fire again
+            -- before then, and its first windows held so hit 67.5% behind walls and 84% in sight in checkpoint 72 (the
+            -- Sniper 70% against 45% cold). A fast gun waits only FAST_WARM: its first window behind a wall hit 22% when
+            -- it went out about 0.09s after the body was placed (checkpoint 75). An escape cannot wait
+            local warmFor = slowGun and WARM_UP or FAST_WARM
+            if not escape and v65('hookWarm') then
                 local began = os.clock()
                 local waited = nil
-                while DesyncController.active and os.clock() - began < WARM_UP do
+                while DesyncController.active and os.clock() - began < warmFor do
                     local placedAt = DesyncController.placedAt
-                    if placedAt and os.clock() - placedAt >= WARM_UP then break end
+                    if placedAt and os.clock() - placedAt >= warmFor then break end
                     DesyncController.expireAt = math.max(DesyncController.expireAt or 0, os.clock() + 0.6)
                     self.holdUntil = math.max(self.holdUntil or 0, os.clock() + 0.05)
                     task.wait()
@@ -4703,11 +4708,11 @@ do
         env.RivalsStats:Record(targetPlayer, { direct = true, visible = true, silent = true, body = true, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, window = window })
     end
 
-    -- the autofire asks this before it presses. With a slow gun at a target behind a wall the body goes to its desync
-    -- spot first, and the trigger stays up until the server has had WARM_UP to see it there: the shot then goes out at
-    -- once from a warm spot instead of waiting in the hook. The spot is kept while the gun cycles (a Sniper's 1.6s is
-    -- longer than any linger, so each shot would start a cold one) until the trigger has been down a while with no
-    -- shot: a reload, when the body would only wait next to the target
+    -- the autofire asks this before it presses. At a target behind a wall the body goes to its desync spot first, and
+    -- the trigger stays up until the server has had time to see it there (WARM_UP for a slow gun, FAST_WARM for a fast
+    -- one): the shot then goes out at once from a warm spot instead of waiting in the hook. The spot is kept while the
+    -- gun cycles (a Sniper's 1.6s is longer than any linger, so each shot would start a cold one) until the trigger
+    -- has been down a while with no shot: a reload, when the body would only wait next to the target
     function WallbangController:Prewarm()
         if not self.active then return false end
         local now = os.clock()
@@ -4747,7 +4752,8 @@ do
         end
         if not isGun then return press() end
         local cycle = ShotWindow.RealCycle(item)
-        if not (cycle >= SLOW_CYCLE) then return press() end
+        if cycle ~= cycle then cycle = 0 end
+        local warmFor = cycle >= SLOW_CYCLE and WARM_UP or FAST_WARM
         if self.pressFrom and now - self.pressFrom > cycle + PREWARM_DRY then return press() end
         local desync = DesyncController
         if not desync.active or desync.startTarget ~= target then
@@ -4766,7 +4772,7 @@ do
             self.desyncCleanup = nil
         end
         local placedAt = desync.placedAt
-        if now - (desync.startedAt or now) >= PREWARM_MAX or (placedAt and now - placedAt >= WARM_UP) then
+        if now - (desync.startedAt or now) >= PREWARM_MAX or (placedAt and now - placedAt >= warmFor) then
             return press()
         end
         self.prewarmFrom = self.prewarmFrom or now
@@ -5412,7 +5418,7 @@ local function tick()
 		return
 	end
 
-	-- a slow gun at a target behind a wall: the aim puts the body at its desync spot first and the trigger stays up
+	-- a target behind a wall: the aim puts the body at its desync spot first and the trigger stays up
 	-- until the server can see it there; a request still waiting inside the hook keeps it up too (see Prewarm in the aim)
 	if not melee and env.RivalsPrewarm then
 		local ok, wait = pcall(env.RivalsPrewarm)
