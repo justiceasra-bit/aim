@@ -2419,8 +2419,10 @@ env.RivalsTuner = {
 do
     local Tuner = env.RivalsTuner
     local MIN_TRIALS = 5
-    local EXPLORE = 0.12
-    local EXPLORE_SURE = 0.03
+    -- in checkpoints 75-76, 59% of windows tried at least one choice that was not the best one, and windows trying
+    -- two or three hit 56% against 66% for none: with seeds from 43,000 windows the tuner needs far less trying
+    local EXPLORE = 0.05
+    local EXPLORE_SURE = 0.02
     local SURE_AFTER = 15
     local SURE_RATIO = 2.5
     local DECAY_AT = 300
@@ -2563,156 +2565,183 @@ do
     Tuner:AddDimension('reach', { 'move', 'stay' })
     Tuner:AddDimension('reachNear', { 'move', 'stay' })
     Tuner:AddDimension('flankReach', { 'near', 'mid', 'far' })
+    Tuner:AddDimension('meleeStill', { 'far', 'near' })
 
     -- each weapon's own start, from the fire-window tables of checkpoint 64's 1333 matches: per window, credited like
     -- the tuner credits (damage squared). Left out: windows whose body never moved, invincible targets, shield-blocked
     -- shots, and shots fired in a desync's first 0.25s (they hit 42% where the same arms hit 66-73% later, and
     -- checkpoint 71 waits that time out), which had made moving the body and the 'shooter' origin look worse than they are
     local SEEDS = {
-        ["direct@Assault Rifle"] = { near = { 1767.7, 8809 }, camera = { 1805.8, 9464 } },
-        ["direct@Bow"] = { near = { 9.4, 85 }, camera = { 25.8, 200 } },
-        ["direct@Burst Rifle"] = { near = { 73.6, 273 }, camera = { 31.3, 130 } },
-        ["direct@Crossbow"] = { near = { 42.7, 100 }, camera = { 59.8, 124 } },
-        ["direct@Daggers"] = { near = { 10.9, 110 }, camera = { 19, 156 } },
-        ["direct@Energy Pistols"] = { near = { 150.9, 942 }, camera = { 189.5, 1140 } },
-        ["direct@Energy Rifle"] = { near = { 42.4, 161 }, camera = { 14.9, 67 } },
-        ["direct@Exogun"] = { near = { 31.1, 135 }, camera = { 18.2, 75 } },
-        ["direct@Handgun"] = { near = { 164.7, 852 }, camera = { 266.2, 1442 } },
-        ["direct@Minigun"] = { near = { 52.2, 377 }, camera = { 43.6, 378 } },
-        ["direct@Paintball Gun"] = { near = { 3.2, 41 }, camera = { 2.2, 56 } },
-        ["direct@Revolver"] = { near = { 74.5, 476 }, camera = { 83.7, 467 } },
-        ["direct@Shotgun"] = { near = { 144.1, 727 }, camera = { 92.9, 553 } },
-        ["direct@Slingshot"] = { near = { 14.2, 152 }, camera = { 0.9, 31 } },
-        ["direct@Sniper"] = { near = { 267.5, 936 }, camera = { 291, 966 } },
-        ["direct@Spray"] = { near = { 41.7, 165 }, camera = { 20.3, 86 } },
-        ["direct@Uzi"] = { near = { 144.9, 850 }, camera = { 112.9, 629 } },
-        ["direct@Wildcat"] = { near = { 297.5, 1708 }, camera = { 410.2, 2146 } },
-        ["facing@Assault Rifle"] = { look = { 3936.1, 15549 }, old = { 4244.3, 16632 } },
-        ["facing@Bow"] = { look = { 23.4, 176 }, old = { 14.3, 159 } },
-        ["facing@Burst Rifle"] = { look = { 67.3, 241 }, old = { 113.3, 420 } },
-        ["facing@Crossbow"] = { look = { 47.9, 103 }, old = { 54.5, 122 } },
-        ["facing@Daggers"] = { look = { 25.1, 197 }, old = { 5.8, 101 } },
-        ["facing@Energy Pistols"] = { look = { 265.9, 1370 }, old = { 302.4, 1871 } },
-        ["facing@Energy Rifle"] = { look = { 79.2, 241 }, old = { 66.4, 214 } },
-        ["facing@Exogun"] = { look = { 50.3, 161 }, old = { 39.4, 143 } },
-        ["facing@Handgun"] = { look = { 387.9, 1639 }, old = { 537.8, 2303 } },
-        ["facing@Minigun"] = { look = { 114.6, 751 }, old = { 75.5, 544 } },
-        ["facing@Paintball Gun"] = { look = { 8, 93 }, old = { 4, 58 } },
-        ["facing@Revolver"] = { look = { 128.2, 651 }, old = { 79, 452 } },
-        ["facing@Shotgun"] = { look = { 199.2, 935 }, old = { 197.6, 936 } },
-        ["facing@Slingshot"] = { look = { 38.5, 338 }, old = { 11.8, 170 } },
-        ["facing@Sniper"] = { look = { 319.4, 1110 }, old = { 270.8, 897 } },
-        ["facing@Spray"] = { look = { 80.4, 303 }, old = { 75.9, 245 } },
-        ["facing@Uzi"] = { look = { 166, 883 }, old = { 234.4, 1116 } },
-        ["facing@Wildcat"] = { look = { 872.8, 3697 }, old = { 568.1, 2472 } },
-        ["hitpart@Assault Rifle"] = { hitbox = { 3198.2, 11740 }, head = { 3569.6, 13103 } },
-        ["hitpart@Assault Rifle#still"] = { hitbox = { 733.8, 3474 }, head = { 678.8, 3863 } },
-        ["hitpart@Bow"] = { hitbox = { 18.7, 182 }, head = { 13.2, 108 } },
-        ["hitpart@Bow#still"] = { hitbox = { 5.8, 33 }, head = { 0.1, 12 } },
-        ["hitpart@Burst Rifle"] = { hitbox = { 90.6, 321 }, head = { 65.4, 216 } },
-        ["hitpart@Burst Rifle#still"] = { hitbox = { 16.7, 91 }, head = { 7.8, 33 } },
-        ["hitpart@Crossbow"] = { hitbox = { 42.4, 89 }, head = { 55.5, 109 } },
-        ["hitpart@Daggers"] = { hitbox = { 7.7, 118 }, head = { 17.7, 137 } },
-        ["hitpart@Daggers#still"] = { hitbox = { 2.4, 25 }, head = { 3.1, 18 } },
-        ["hitpart@Energy Pistols"] = { hitbox = { 315.2, 1645 }, head = { 179.7, 912 } },
-        ["hitpart@Energy Pistols#still"] = { hitbox = { 56.2, 451 }, head = { 17.2, 233 } },
-        ["hitpart@Energy Rifle"] = { hitbox = { 66.9, 199 }, head = { 48.2, 142 } },
-        ["hitpart@Energy Rifle#still"] = { hitbox = { 9.7, 39 }, head = { 20.9, 75 } },
-        ["hitpart@Exogun"] = { hitbox = { 44.5, 151 }, head = { 32.7, 116 } },
-        ["hitpart@Exogun#still"] = { hitbox = { 10.1, 22 }, head = { 2.3, 15 } },
-        ["hitpart@Handgun"] = { hitbox = { 451.2, 1913 }, head = { 354.3, 1262 } },
-        ["hitpart@Handgun#still"] = { hitbox = { 85.2, 474 }, head = { 35.1, 293 } },
-        ["hitpart@Minigun"] = { hitbox = { 78.6, 505 }, head = { 70.4, 429 } },
-        ["hitpart@Minigun#still"] = { hitbox = { 23.3, 189 }, head = { 17.7, 172 } },
-        ["hitpart@Paintball Gun"] = { hitbox = { 6.3, 61 }, head = { 5.4, 84 } },
-        ["hitpart@Revolver"] = { hitbox = { 61.5, 355 }, head = { 110.7, 552 } },
-        ["hitpart@Revolver#still"] = { hitbox = { 13.6, 96 }, head = { 21.5, 100 } },
-        ["hitpart@Shotgun"] = { hitbox = { 158.2, 720 }, head = { 161, 777 } },
-        ["hitpart@Shotgun#still"] = { hitbox = { 37.8, 175 }, head = { 39.8, 199 } },
-        ["hitpart@Slingshot"] = { hitbox = { 27.5, 230 }, head = { 7.4, 142 } },
-        ["hitpart@Slingshot#still"] = { hitbox = { 1.9, 27 }, head = { 13.5, 109 } },
-        ["hitpart@Sniper"] = { hitbox = { 246.4, 901 }, head = { 288.8, 901 } },
-        ["hitpart@Sniper#still"] = { hitbox = { 24.1, 85 }, head = { 30.8, 120 } },
-        ["hitpart@Spray"] = { hitbox = { 71.2, 245 }, head = { 59.7, 187 } },
-        ["hitpart@Spray#still"] = { hitbox = { 14.9, 67 }, head = { 10.4, 49 } },
-        ["hitpart@Uzi"] = { hitbox = { 179.5, 836 }, head = { 179.8, 831 } },
-        ["hitpart@Uzi#still"] = { hitbox = { 28.2, 169 }, head = { 13, 163 } },
-        ["hitpart@Wildcat"] = { hitbox = { 599.1, 2431 }, head = { 598.7, 2407 } },
-        ["hitpart@Wildcat#still"] = { hitbox = { 129.7, 739 }, head = { 113.4, 592 } },
-        ["origin@Assault Rifle"] = { under = { 1386, 4340 }, shooter = { 1166.7, 3434 }, clear = { 1274.2, 3867 } },
-        ["origin@Bow"] = { under = { 0.2, 10 }, shooter = { 0, 17 }, clear = { 0, 7 } },
-        ["origin@Burst Rifle"] = { under = { 14.7, 56 }, shooter = { 33, 108 }, clear = { 25, 78 } },
-        ["origin@Energy Pistols"] = { under = { 49.3, 259 }, shooter = { 8.7, 66 }, clear = { 48.9, 319 } },
-        ["origin@Energy Rifle"] = { under = { 15.7, 49 }, shooter = { 22.2, 66 }, clear = { 47.5, 104 } },
-        ["origin@Exogun"] = { under = { 13.6, 25 }, shooter = { 7.3, 18 }, clear = { 18.7, 45 } },
-        ["origin@Handgun"] = { under = { 162.2, 563 }, shooter = { 131.4, 363 }, clear = { 137.4, 468 } },
-        ["origin@Minigun"] = { under = { 28.5, 140 }, shooter = { 20.4, 127 }, clear = { 31.3, 158 } },
-        ["origin@Paintball Gun"] = { under = { 2, 10 }, shooter = { 1, 8 }, clear = { 3, 20 } },
-        ["origin@Revolver"] = { under = { 5.6, 28 }, shooter = { 18.8, 48 }, clear = { 17.8, 57 } },
-        ["origin@Shotgun"] = { under = { 52.2, 188 }, shooter = { 39.3, 140 }, clear = { 37.8, 141 } },
-        ["origin@Slingshot"] = { under = { 6.8, 66 }, shooter = { 8.5, 78 }, clear = { 16.8, 157 } },
-        ["origin@Sniper"] = { under = { 6.1, 33 }, shooter = { 4.3, 19 }, clear = { 8.6, 26 } },
-        ["origin@Spray"] = { under = { 18.1, 60 }, shooter = { 25.6, 78 }, clear = { 22.5, 79 } },
-        ["origin@Uzi"] = { under = { 15.1, 58 }, shooter = { 56.2, 201 }, clear = { 11.8, 38 } },
-        ["origin@Wildcat"] = { under = { 163.5, 604 }, shooter = { 212.5, 641 }, clear = { 201.3, 614 } },
-        ["point@Assault Rifle"] = { center = { 1880.8, 6467 }, lead = { 1491.6, 5677 }, split = { 1535.9, 5752 }, ahead = { 1859.5, 6947 } },
-        ["point@Assault Rifle#still"] = { center = { 313.5, 1737 }, lead = { 266, 1639 }, split = { 425.6, 1983 }, ahead = { 407.3, 1979 } },
-        ["point@Bow"] = { center = { 7.1, 53 }, lead = { 4.6, 58 }, split = { 10.8, 78 }, ahead = { 9.3, 101 } },
-        ["point@Bow#still"] = { center = { 2, 15 }, lead = { 0.1, 6 }, split = { 0.2, 7 }, ahead = { 3.5, 17 } },
-        ["point@Burst Rifle"] = { center = { 52.9, 161 }, lead = { 39.9, 129 }, split = { 30.9, 109 }, ahead = { 32.3, 138 } },
-        ["point@Burst Rifle#still"] = { center = { 3.9, 34 }, lead = { 3.4, 18 }, split = { 6.8, 34 }, ahead = { 10.5, 38 } },
-        ["point@Crossbow"] = { center = { 23.8, 47 }, lead = { 33.6, 61 }, split = { 28.3, 55 }, ahead = { 12.2, 35 } },
-        ["point@Daggers"] = { center = { 5.9, 64 }, lead = { 2.3, 35 }, split = { 5.4, 68 }, ahead = { 11.8, 88 } },
-        ["point@Daggers#still"] = { center = { 2.2, 6 }, lead = { 1, 7 }, split = { 0.6, 10 }, ahead = { 1.6, 20 } },
-        ["point@Energy Pistols"] = { center = { 99.1, 566 }, lead = { 132.9, 599 }, split = { 127.2, 749 }, ahead = { 135.7, 643 } },
-        ["point@Energy Pistols#still"] = { center = { 9.3, 142 }, lead = { 23.1, 212 }, split = { 22.4, 184 }, ahead = { 18.7, 146 } },
-        ["point@Energy Rifle"] = { center = { 40.9, 141 }, lead = { 51.2, 115 }, split = { 12.5, 39 }, ahead = { 10.4, 46 } },
-        ["point@Energy Rifle#still"] = { center = { 12.4, 38 }, lead = { 10.3, 44 }, split = { 4.1, 18 }, ahead = { 3.8, 14 } },
-        ["point@Exogun"] = { center = { 21.4, 90 }, lead = { 18.7, 58 }, split = { 16.9, 59 }, ahead = { 20.2, 60 } },
-        ["point@Exogun#still"] = { center = { 3.4, 9 }, lead = { 2.6, 8 }, split = { 3.1, 6 }, ahead = { 3.4, 14 } },
-        ["point@Handgun"] = { center = { 242.3, 977 }, lead = { 171.8, 693 }, split = { 230.8, 852 }, ahead = { 160.6, 653 } },
-        ["point@Handgun#still"] = { center = { 25.1, 210 }, lead = { 28.2, 200 }, split = { 42, 194 }, ahead = { 25, 163 } },
-        ["point@Minigun"] = { center = { 61.1, 327 }, lead = { 17.6, 153 }, split = { 34.6, 236 }, ahead = { 35.7, 218 } },
-        ["point@Minigun#still"] = { center = { 11.7, 96 }, lead = { 9.1, 84 }, split = { 9.8, 84 }, ahead = { 10.4, 97 } },
-        ["point@Paintball Gun"] = { center = { 3.5, 45 }, lead = { 2.8, 42 }, split = { 2.4, 28 }, ahead = { 3.2, 30 } },
-        ["point@Revolver"] = { center = { 35, 219 }, lead = { 41.9, 198 }, split = { 69.9, 332 }, ahead = { 25.4, 158 } },
-        ["point@Revolver#still"] = { center = { 9.2, 52 }, lead = { 7, 43 }, split = { 12.8, 63 }, ahead = { 6, 38 } },
-        ["point@Shotgun"] = { center = { 91.9, 421 }, lead = { 91.4, 405 }, split = { 66.2, 335 }, ahead = { 69.7, 336 } },
-        ["point@Shotgun#still"] = { center = { 19.1, 94 }, lead = { 20.2, 99 }, split = { 21.6, 94 }, ahead = { 16.6, 87 } },
-        ["point@Slingshot"] = { center = { 7.7, 87 }, lead = { 8.5, 94 }, split = { 7.7, 85 }, ahead = { 10.9, 106 } },
-        ["point@Slingshot#still"] = { center = { 0.3, 17 }, lead = { 2.3, 20 }, split = { 4.9, 29 }, ahead = { 7.8, 70 } },
-        ["point@Sniper"] = { center = { 129.9, 449 }, lead = { 137.9, 458 }, split = { 162.4, 526 }, ahead = { 105, 369 } },
-        ["point@Sniper#still"] = { center = { 12.5, 50 }, lead = { 10.8, 50 }, split = { 16.1, 57 }, ahead = { 15.6, 48 } },
-        ["point@Spray"] = { center = { 37.3, 120 }, lead = { 43.2, 135 }, split = { 27.1, 93 }, ahead = { 23.3, 84 } },
-        ["point@Spray#still"] = { center = { 5, 26 }, lead = { 9.9, 46 }, split = { 4.8, 24 }, ahead = { 5.6, 20 } },
-        ["point@Uzi"] = { center = { 83.3, 397 }, lead = { 102.4, 461 }, split = { 91, 389 }, ahead = { 82.5, 420 } },
-        ["point@Uzi#still"] = { center = { 5.1, 77 }, lead = { 6.3, 59 }, split = { 18.1, 109 }, ahead = { 11.6, 87 } },
-        ["point@Wildcat"] = { center = { 301.5, 1182 }, lead = { 355.9, 1422 }, split = { 318.6, 1325 }, ahead = { 221.8, 909 } },
-        ["point@Wildcat#still"] = { center = { 48.3, 304 }, lead = { 36, 279 }, split = { 94, 415 }, ahead = { 64.9, 333 } },
-        ["reach@Assault Rifle"] = { move = { 361.5, 883 }, stay = { 610, 2463 } },
-        ["reach@Burst Rifle"] = { stay = { 15.7, 58 } },
-        ["reach@Energy Pistols"] = { move = { 42.7, 203 }, stay = { 51.2, 220 } },
-        ["reach@Handgun"] = { move = { 22.9, 67 }, stay = { 82, 433 } },
-        ["reach@Minigun"] = { move = { 5.9, 67 }, stay = { 29.4, 156 } },
-        ["reach@Revolver"] = { stay = { 14.9, 57 } },
-        ["reach@Shotgun"] = { move = { 6.4, 22 }, stay = { 38.4, 187 } },
-        ["reach@Slingshot"] = { move = { 3.1, 24 }, stay = { 0.5, 8 } },
-        ["reach@Sniper"] = { stay = { 28.9, 100 } },
-        ["reach@Spray"] = { move = { 13.9, 32 }, stay = { 5.7, 24 } },
-        ["reach@Uzi"] = { move = { 25, 89 }, stay = { 14.2, 57 } },
-        ["reach@Wildcat"] = { move = { 70.4, 185 }, stay = { 66.9, 264 } },
-        ["reachNear@Assault Rifle"] = { move = { 331.9, 992 }, stay = { 678.6, 2254 } },
-        ["reachNear@Bow"] = { move = { 0, 6 }, stay = { 8.3, 57 } },
-        ["reachNear@Burst Rifle"] = { move = { 2.6, 11 }, stay = { 6.2, 23 } },
-        ["reachNear@Energy Pistols"] = { move = { 63.4, 224 }, stay = { 159.9, 714 } },
-        ["reachNear@Handgun"] = { move = { 26.9, 100 }, stay = { 110.6, 357 } },
-        ["reachNear@Minigun"] = { move = { 5.5, 25 }, stay = { 15.1, 122 } },
-        ["reachNear@Paintball Gun"] = { move = { 0.6, 16 }, stay = { 0.5, 14 } },
-        ["reachNear@Shotgun"] = { move = { 7.4, 31 }, stay = { 47.2, 165 } },
-        ["reachNear@Sniper"] = { move = { 3.1, 5 }, stay = { 28.7, 77 } },
-        ["reachNear@Spray"] = { move = { 9.9, 36 }, stay = { 6.8, 31 } },
-        ["reachNear@Uzi"] = { move = { 31.3, 90 }, stay = { 54, 225 } },
-        ["reachNear@Wildcat"] = { move = { 61.5, 177 }, stay = { 144.8, 427 } },
+        ["desync@Assault Rifle"] = { above = { 1157.5, 3631 }, glue = { 967.3, 3215 } },
+        ["desync@Bow"] = { above = { 3.1, 79 }, glue = { 1.2, 42 } },
+        ["desync@Burst Rifle"] = { above = { 33, 85 }, glue = { 24.4, 66 } },
+        ["desync@Crossbow"] = { above = { 26.4, 56 }, glue = { 16.5, 26 } },
+        ["desync@Daggers"] = { above = { 13.7, 91 }, glue = { 4.9, 53 } },
+        ["desync@Energy Pistols"] = { above = { 14.5, 80 }, glue = { 31.6, 122 } },
+        ["desync@Handgun"] = { above = { 92.6, 291 }, glue = { 93.3, 325 } },
+        ["desync@RPG"] = { above = { 14.4, 60 }, glue = { 8, 30 } },
+        ["desync@Revolver"] = { above = { 10.5, 51 }, glue = { 3.7, 23 } },
+        ["desync@Shotgun"] = { above = { 123.5, 296 }, glue = { 109.5, 320 } },
+        ["desync@Slingshot"] = { above = { 10.4, 58 } },
+        ["desync@Sniper"] = { above = { 75.4, 156 }, glue = { 55.8, 134 } },
+        ["desync@Spray"] = { above = { 58.2, 196 }, glue = { 74.3, 223 } },
+        ["desync@Uzi"] = { above = { 85.6, 353 }, glue = { 95.7, 348 } },
+        ["desync@Wildcat"] = { above = { 196.8, 861 }, glue = { 137.2, 572 } },
+        ["direct@Assault Rifle"] = { near = { 1040.6, 4635 }, camera = { 562.9, 2707 } },
+        ["direct@Bow"] = { near = { 7.8, 54 }, camera = { 6.1, 40 } },
+        ["direct@Burst Rifle"] = { near = { 33.4, 101 }, camera = { 34.1, 99 } },
+        ["direct@Crossbow"] = { near = { 39.3, 71 }, camera = { 79.3, 160 } },
+        ["direct@Daggers"] = { near = { 3.3, 32 }, camera = { 6.5, 48 } },
+        ["direct@Energy Pistols"] = { near = { 15.4, 135 }, camera = { 107.3, 483 } },
+        ["direct@Exogun"] = { near = { 31.1, 50 }, camera = { 58.4, 84 } },
+        ["direct@Handgun"] = { near = { 132, 579 }, camera = { 28.4, 147 } },
+        ["direct@Permafrost"] = { near = { 50.4, 131 }, camera = { 45.3, 110 } },
+        ["direct@RPG"] = { near = { 4.1, 33 }, camera = { 4.2, 40 } },
+        ["direct@Revolver"] = { near = { 22.4, 122 }, camera = { 34.7, 210 } },
+        ["direct@Shotgun"] = { near = { 107.4, 481 }, camera = { 40.2, 225 } },
+        ["direct@Slingshot"] = { near = { 1.2, 68 }, camera = { 2.1, 59 } },
+        ["direct@Sniper"] = { near = { 171.1, 472 }, camera = { 262.3, 727 } },
+        ["direct@Spray"] = { near = { 74.4, 287 }, camera = { 69.6, 253 } },
+        ["direct@Uzi"] = { near = { 71.8, 409 }, camera = { 101.7, 598 } },
+        ["direct@Wildcat"] = { near = { 623.4, 2661 }, camera = { 436.2, 1970 } },
+        ["facing@Assault Rifle"] = { look = { 2067, 8076 }, old = { 3167.8, 11423 } },
+        ["facing@Bow"] = { look = { 35.2, 370 } },
+        ["facing@Burst Rifle"] = { look = { 119.4, 324 }, old = { 48.3, 183 } },
+        ["facing@Crossbow"] = { look = { 173.9, 315 }, old = { 136.3, 250 } },
+        ["facing@Daggers"] = { look = { 40.5, 378 } },
+        ["facing@Energy Pistols"] = { look = { 172.8, 811 }, old = { 21.2, 121 } },
+        ["facing@Exogun"] = { look = { 39.6, 67 }, old = { 69.5, 95 } },
+        ["facing@Handgun"] = { look = { 275.5, 955 }, old = { 223.4, 932 } },
+        ["facing@Permafrost"] = { look = { 50.6, 120 }, old = { 55.6, 140 } },
+        ["facing@RPG"] = { look = { 45.4, 221 } },
+        ["facing@Revolver"] = { look = { 65.5, 407 }, old = { 45.1, 263 } },
+        ["facing@Shotgun"] = { look = { 269.4, 949 }, old = { 324.1, 1165 } },
+        ["facing@Slingshot"] = { look = { 17.2, 225 } },
+        ["facing@Sniper"] = { look = { 264.5, 699 }, old = { 561, 1442 } },
+        ["facing@Spray"] = { look = { 159, 654 }, old = { 313.7, 1106 } },
+        ["facing@Uzi"] = { look = { 148.4, 756 }, old = { 370.2, 1821 } },
+        ["facing@Wildcat"] = { look = { 851.7, 3823 }, old = { 1010.9, 4088 } },
+        ["hitpart@Assault Rifle"] = { hitbox = { 685.2, 2903 }, head = { 854.8, 3183 }, box = { 2729.8, 8749 } },
+        ["hitpart@Assault Rifle#crouch"] = { hitbox = { 39.1, 239 }, head = { 29.5, 171 }, box = { 28.6, 216 } },
+        ["hitpart@Assault Rifle#still"] = { hitbox = { 206.3, 1057 }, head = { 132.2, 783 }, box = { 529.3, 2198 } },
+        ["hitpart@Bow"] = { hitbox = { 7, 64 }, head = { 4.8, 87 }, box = { 8.9, 175 } },
+        ["hitpart@Bow#still"] = { hitbox = { 2.8, 7 }, head = { 2, 7 }, box = { 9.5, 21 } },
+        ["hitpart@Burst Rifle"] = { hitbox = { 15.2, 63 }, head = { 21.2, 80 }, box = { 102.5, 272 } },
+        ["hitpart@Burst Rifle#still"] = { hitbox = { 2, 7 }, head = { 3.2, 8 }, box = { 19, 54 } },
+        ["hitpart@Crossbow"] = { hitbox = { 36.7, 68 }, head = { 126, 217 }, box = { 116, 181 } },
+        ["hitpart@Crossbow#still"] = { hitbox = { 11.8, 34 }, head = { 7.8, 35 }, box = { 5.6, 14 } },
+        ["hitpart@Daggers"] = { hitbox = { 1.6, 39 }, head = { 3.4, 63 }, box = { 17.2, 220 } },
+        ["hitpart@Daggers#still"] = { hitbox = { 2.6, 5 }, head = { 3.2, 9 }, box = { 12.6, 36 } },
+        ["hitpart@Energy Pistols"] = { hitbox = { 7.9, 69 }, head = { 23.5, 140 }, box = { 115.6, 522 } },
+        ["hitpart@Energy Pistols#still"] = { hitbox = { 1, 12 }, head = { 1.1, 9 }, box = { 42.3, 169 } },
+        ["hitpart@Exogun"] = { hitbox = { 18.9, 35 }, head = { 43, 55 }, box = { 38.3, 56 } },
+        ["hitpart@Handgun"] = { hitbox = { 61.1, 214 }, head = { 88.1, 337 }, box = { 283.4, 1032 } },
+        ["hitpart@Handgun#crouch"] = { hitbox = { 2.3, 11 }, head = { 3.4, 16 }, box = { 3.6, 20 } },
+        ["hitpart@Handgun#still"] = { hitbox = { 7.4, 39 }, head = { 8.1, 37 }, box = { 41.7, 181 } },
+        ["hitpart@Permafrost"] = { hitbox = { 27.5, 85 }, head = { 36.9, 86 }, box = { 32.2, 61 } },
+        ["hitpart@RPG"] = { hitbox = { 9.6, 40 }, head = { 7.8, 57 }, box = { 16, 79 } },
+        ["hitpart@RPG#still"] = { hitbox = { 3.5, 10 }, head = { 1.4, 13 }, box = { 7.1, 22 } },
+        ["hitpart@Revolver"] = { hitbox = { 19.4, 127 }, head = { 17.8, 125 }, box = { 57.7, 246 } },
+        ["hitpart@Revolver#crouch"] = { hitbox = { 1.4, 12 }, head = { 0.2, 14 }, box = { 2.3, 7 } },
+        ["hitpart@Revolver#still"] = { hitbox = { 2.3, 19 }, head = { 2.7, 58 }, box = { 6.6, 62 } },
+        ["hitpart@Shotgun"] = { hitbox = { 110.1, 392 }, head = { 99.3, 374 }, box = { 224.1, 731 } },
+        ["hitpart@Shotgun#crouch"] = { hitbox = { 17.9, 56 }, head = { 11.8, 43 }, box = { 14.4, 40 } },
+        ["hitpart@Shotgun#still"] = { hitbox = { 27.6, 135 }, head = { 15.4, 90 }, box = { 73.1, 253 } },
+        ["hitpart@Slingshot"] = { hitbox = { 1.2, 48 }, head = { 2.1, 45 }, box = { 6.6, 74 } },
+        ["hitpart@Slingshot#still"] = { hitbox = { 2.8, 11 }, head = { 0.2, 8 }, box = { 4.1, 30 } },
+        ["hitpart@Sniper"] = { hitbox = { 156.1, 397 }, head = { 219.2, 537 }, box = { 317.2, 758 } },
+        ["hitpart@Sniper#crouch"] = { hitbox = { 11.8, 28 }, head = { 8.2, 25 }, box = { 10, 24 } },
+        ["hitpart@Sniper#still"] = { hitbox = { 32.8, 140 }, head = { 10.4, 68 }, box = { 59.8, 164 } },
+        ["hitpart@Spray"] = { hitbox = { 94.2, 350 }, head = { 106, 388 }, box = { 176.1, 588 } },
+        ["hitpart@Spray#crouch"] = { hitbox = { 8.5, 54 }, head = { 2.4, 28 }, box = { 6, 30 } },
+        ["hitpart@Spray#still"] = { hitbox = { 21.2, 85 }, head = { 12.1, 76 }, box = { 46, 161 } },
+        ["hitpart@Uzi"] = { hitbox = { 103.2, 516 }, head = { 107, 544 }, box = { 221.9, 949 } },
+        ["hitpart@Uzi#crouch"] = { hitbox = { 5.8, 60 }, head = { 8.5, 53 }, box = { 1.4, 30 } },
+        ["hitpart@Uzi#still"] = { hitbox = { 24.6, 135 }, head = { 10.2, 74 }, box = { 36.2, 216 } },
+        ["hitpart@Wildcat"] = { hitbox = { 358.8, 1522 }, head = { 431.8, 1933 }, box = { 809.1, 3160 } },
+        ["hitpart@Wildcat#crouch"] = { hitbox = { 20.8, 90 }, head = { 21.5, 88 }, box = { 17.7, 101 } },
+        ["hitpart@Wildcat#still"] = { hitbox = { 52.8, 264 }, head = { 64.5, 314 }, box = { 85.5, 439 } },
+        ["origin@Assault Rifle"] = { under = { 465.3, 1656 }, shooter = { 1052.9, 3192 }, clear = { 606.6, 1998 } },
+        ["origin@Bow"] = { under = { 0.8, 45 }, shooter = { 1.6, 28 }, clear = { 2, 48 } },
+        ["origin@Burst Rifle"] = { under = { 8.1, 28 }, shooter = { 7.4, 19 }, clear = { 42, 104 } },
+        ["origin@Crossbow"] = { under = { 15.8, 31 }, shooter = { 18.5, 30 }, clear = { 8.5, 21 } },
+        ["origin@Daggers"] = { under = { 4.8, 37 }, shooter = { 10.2, 60 }, clear = { 3.5, 47 } },
+        ["origin@Energy Pistols"] = { under = { 6.2, 24 }, shooter = { 38.9, 172 }, clear = { 1, 6 } },
+        ["origin@Handgun"] = { under = { 30.2, 117 }, shooter = { 102.5, 349 }, clear = { 53.2, 150 } },
+        ["origin@RPG"] = { under = { 4.3, 21 }, shooter = { 2.4, 19 }, clear = { 15.8, 50 } },
+        ["origin@Revolver"] = { under = { 4.5, 19 }, shooter = { 7.9, 48 }, clear = { 1.7, 7 } },
+        ["origin@Shotgun"] = { under = { 59.6, 165 }, shooter = { 116.3, 289 }, clear = { 57.1, 162 } },
+        ["origin@Slingshot"] = { under = { 1, 11 }, shooter = { 7.8, 38 }, clear = { 1.7, 9 } },
+        ["origin@Sniper"] = { under = { 34.4, 87 }, shooter = { 32.4, 79 }, clear = { 64.5, 124 } },
+        ["origin@Spray"] = { under = { 37.2, 121 }, shooter = { 63.1, 201 }, clear = { 32.2, 97 } },
+        ["origin@Uzi"] = { under = { 28.2, 137 }, shooter = { 54.8, 207 }, clear = { 98.3, 357 } },
+        ["origin@Wildcat"] = { under = { 69.1, 310 }, shooter = { 136.4, 579 }, clear = { 128.5, 544 } },
+        ["point@Assault Rifle"] = { center = { 1938.4, 6012 }, lead = { 770, 3002 }, split = { 821.4, 2997 }, ahead = { 740, 2824 } },
+        ["point@Assault Rifle#crouch"] = { center = { 35.7, 222 }, lead = { 24, 145 }, split = { 22.7, 144 }, ahead = { 14.7, 115 } },
+        ["point@Assault Rifle#still"] = { center = { 162.6, 889 }, lead = { 93, 639 }, split = { 386.5, 1492 }, ahead = { 225.7, 1018 } },
+        ["point@Bow"] = { center = { 10, 144 }, lead = { 2, 52 }, split = { 6.2, 88 }, ahead = { 2.5, 42 } },
+        ["point@Bow#still"] = { center = { 3.5, 7 }, lead = { 4.2, 11 }, split = { 5.2, 10 }, ahead = { 1.2, 7 } },
+        ["point@Burst Rifle"] = { center = { 77.9, 215 }, lead = { 28.4, 80 }, split = { 18.8, 66 }, ahead = { 13.7, 54 } },
+        ["point@Burst Rifle#still"] = { center = { 3.8, 7 }, lead = { 3.5, 13 }, split = { 1, 5 }, ahead = { 15.8, 44 } },
+        ["point@Crossbow"] = { center = { 55.5, 83 }, lead = { 147.8, 247 }, split = { 49.4, 88 }, ahead = { 26, 48 } },
+        ["point@Crossbow#still"] = { center = { 3.3, 25 }, lead = { 4.4, 27 }, split = { 13.2, 23 }, ahead = { 4.3, 8 } },
+        ["point@Daggers"] = { center = { 3.8, 80 }, lead = { 1.7, 50 }, split = { 8.7, 83 }, ahead = { 7.9, 109 } },
+        ["point@Daggers#still"] = { center = { 14.3, 33 }, lead = { 3.4, 12 } },
+        ["point@Energy Pistols"] = { center = { 31.4, 156 }, lead = { 86, 389 }, split = { 11.5, 78 }, ahead = { 18.1, 108 } },
+        ["point@Energy Pistols#still"] = { center = { 6.8, 29 }, lead = { 3.5, 22 }, split = { 30.1, 114 }, ahead = { 3.9, 25 } },
+        ["point@Exogun"] = { center = { 27.5, 38 }, lead = { 26, 36 }, split = { 15.5, 23 }, ahead = { 31.4, 49 } },
+        ["point@Handgun"] = { center = { 134.7, 510 }, lead = { 93.1, 327 }, split = { 130.4, 486 }, ahead = { 74.3, 260 } },
+        ["point@Handgun#crouch"] = { center = { 4.1, 18 }, lead = { 1.4, 7 }, split = { 1.4, 6 }, ahead = { 2.4, 16 } },
+        ["point@Handgun#still"] = { center = { 4.9, 28 }, lead = { 7.5, 37 }, split = { 31, 134 }, ahead = { 13.7, 58 } },
+        ["point@Permafrost"] = { center = { 36.7, 80 }, lead = { 23.8, 63 }, split = { 14.5, 35 }, ahead = { 21.5, 54 } },
+        ["point@RPG"] = { center = { 8, 50 }, lead = { 7.6, 41 }, split = { 12.2, 61 }, ahead = { 5.6, 24 } },
+        ["point@RPG#still"] = { center = { 2.9, 10 }, lead = { 3.6, 13 }, split = { 3.6, 14 }, ahead = { 2, 8 } },
+        ["point@Revolver"] = { center = { 21.4, 100 }, lead = { 43.6, 203 }, split = { 18, 119 }, ahead = { 11.9, 76 } },
+        ["point@Revolver#crouch"] = { center = { 0.5, 7 }, lead = { 1.2, 5 }, split = { 1.2, 14 }, ahead = { 1, 7 } },
+        ["point@Revolver#still"] = { center = { 5.4, 58 }, lead = { 1.5, 21 }, split = { 3.6, 49 }, ahead = { 1.1, 11 } },
+        ["point@Shotgun"] = { center = { 126.6, 410 }, lead = { 98.8, 383 }, split = { 122.6, 389 }, ahead = { 85.4, 315 } },
+        ["point@Shotgun#crouch"] = { center = { 12.4, 47 }, lead = { 14.2, 38 }, split = { 7.5, 27 }, ahead = { 10, 27 } },
+        ["point@Shotgun#still"] = { center = { 23, 133 }, lead = { 20.3, 101 }, split = { 58.4, 178 }, ahead = { 14.3, 66 } },
+        ["point@Slingshot"] = { center = { 2.1, 55 }, lead = { 6.3, 61 }, split = { 1.4, 28 }, ahead = { 0.1, 23 } },
+        ["point@Slingshot#still"] = { center = { 0.5, 6 }, lead = { 3.1, 21 }, split = { 2.2, 14 }, ahead = { 1.2, 8 } },
+        ["point@Sniper"] = { center = { 191.3, 438 }, lead = { 198, 485 }, split = { 193.7, 489 }, ahead = { 109.5, 280 } },
+        ["point@Sniper#crouch"] = { center = { 17.6, 39 }, lead = { 2.2, 12 }, split = { 4.6, 12 }, ahead = { 5.6, 14 } },
+        ["point@Sniper#still"] = { center = { 25.3, 103 }, lead = { 11.1, 51 }, split = { 20.1, 73 }, ahead = { 46.5, 145 } },
+        ["point@Spray"] = { center = { 117.6, 405 }, lead = { 102.2, 351 }, split = { 85.4, 313 }, ahead = { 71.2, 257 } },
+        ["point@Spray#crouch"] = { center = { 6, 40 }, lead = { 4.1, 27 }, split = { 4.3, 23 }, ahead = { 2.5, 22 } },
+        ["point@Spray#still"] = { center = { 15.5, 85 }, lead = { 10.7, 60 }, split = { 12.6, 55 }, ahead = { 40.7, 122 } },
+        ["point@Uzi"] = { center = { 54.6, 290 }, lead = { 139.5, 725 }, split = { 167, 662 }, ahead = { 70.9, 332 } },
+        ["point@Uzi#crouch"] = { center = { 5.5, 39 }, lead = { 4.3, 46 }, split = { 1.9, 27 }, ahead = { 3.9, 31 } },
+        ["point@Uzi#still"] = { center = { 12.2, 75 }, lead = { 10.5, 75 }, split = { 39.2, 204 }, ahead = { 9.1, 71 } },
+        ["point@Wildcat"] = { center = { 572.1, 2181 }, lead = { 386.9, 1574 }, split = { 301.6, 1299 }, ahead = { 339.1, 1561 } },
+        ["point@Wildcat#crouch"] = { center = { 21.3, 92 }, lead = { 15, 80 }, split = { 11.8, 59 }, ahead = { 11.9, 48 } },
+        ["point@Wildcat#still"] = { center = { 41.6, 234 }, lead = { 32.3, 201 }, split = { 78.7, 354 }, ahead = { 50.2, 228 } },
+        ["reach@Assault Rifle"] = { move = { 136.5, 631 }, stay = { 216.2, 951 } },
+        ["reach@Bow"] = { move = { 0, 11 }, stay = { 3.8, 29 } },
+        ["reach@Burst Rifle"] = { move = { 7.4, 24 }, stay = { 2.6, 10 } },
+        ["reach@Crossbow"] = { move = { 74.2, 113 }, stay = { 20.4, 52 } },
+        ["reach@Daggers"] = { move = { 1, 15 }, stay = { 1.5, 17 } },
+        ["reach@Energy Pistols"] = { stay = { 14.6, 53 } },
+        ["reach@Handgun"] = { move = { 14.4, 80 }, stay = { 12.7, 38 } },
+        ["reach@Revolver"] = { move = { 6.4, 44 }, stay = { 2.6, 14 } },
+        ["reach@Shotgun"] = { move = { 26.5, 84 }, stay = { 13.4, 74 } },
+        ["reach@Sniper"] = { move = { 106.2, 222 }, stay = { 41.1, 114 } },
+        ["reach@Spray"] = { move = { 6.2, 53 }, stay = { 14.7, 66 } },
+        ["reach@Uzi"] = { move = { 38, 205 }, stay = { 37.1, 176 } },
+        ["reach@Wildcat"] = { move = { 70.3, 409 }, stay = { 67.9, 405 } },
+        ["reachNear@Assault Rifle"] = { move = { 99.7, 473 }, stay = { 233.1, 762 } },
+        ["reachNear@Bow"] = { move = { 2.2, 14 }, stay = { 2.8, 17 } },
+        ["reachNear@Burst Rifle"] = { move = { 4, 14 }, stay = { 12.2, 25 } },
+        ["reachNear@Crossbow"] = { move = { 45.2, 70 }, stay = { 35.7, 61 } },
+        ["reachNear@Daggers"] = { move = { 2.2, 16 }, stay = { 3.5, 15 } },
+        ["reachNear@Exogun"] = { move = { 3, 6 }, stay = { 20, 30 } },
+        ["reachNear@Handgun"] = { move = { 8.6, 38 }, stay = { 35.7, 102 } },
+        ["reachNear@Revolver"] = { move = { 4, 50 }, stay = { 7.1, 71 } },
+        ["reachNear@Shotgun"] = { move = { 20, 79 }, stay = { 42.3, 121 } },
+        ["reachNear@Sniper"] = { move = { 67.2, 148 }, stay = { 59.4, 130 } },
+        ["reachNear@Spray"] = { move = { 6, 36 }, stay = { 15.4, 44 } },
+        ["reachNear@Uzi"] = { move = { 16.4, 96 }, stay = { 59.7, 343 } },
+        ["reachNear@Wildcat"] = { move = { 87.9, 361 }, stay = { 182.2, 785 } },
     }
     local SEED_CAP = 150
     local PRIOR = 0.2
@@ -2744,7 +2773,7 @@ do
     end
 
     local FILE = 'rivals_tuner.json'
-    local VERSION = 6
+    local VERSION = 7
 
     local function inherit(source)
         for name in pairs(source) do
@@ -2862,7 +2891,7 @@ do
     end
     local LOG_SIZE = 5000
     local CONSOLE_LINES = 30
-    local SCRIPT_CHECKPOINT = 76
+    local SCRIPT_CHECKPOINT = 78
     local SCRIPT_VERSION = '체크포인트 ' .. SCRIPT_CHECKPOINT
     env.RivalsVersion = SCRIPT_VERSION
 
@@ -3734,6 +3763,7 @@ do
                 end
                 if info.block then table.insert(flags, 'block=' .. tostring(info.block)) end
                 if info.shield then table.insert(flags, 'shield=' .. tostring(info.shield)) end
+                if arms.meleeStill then table.insert(flags, 'meleeStill=' .. tostring(arms.meleeStill)) end
                 if info.moved == false then table.insert(flags, 'notMoved') end
                 local function arm(name) return arms[name] ~= nil and tostring(arms[name]) or '' end
                 local x = info.x or {}
@@ -4142,7 +4172,8 @@ end
 local ShotWindow = { count = 0 }
 -- after two windows in a row at one target missed, half the next windows (picked at random, the rest kept as the
 -- comparison) swap these choices away from what those windows used: in checkpoint 64 a changed choice after a
--- miss streak hit 26.3% against 24.8% kept the same, small and not yet sure, so it is measured as it runs
+-- miss streak hit 26.3% against 24.8% kept the same, but in checkpoints 75-76 both hit 28.5% (2,322 and 2,367
+-- windows): off unless getgenv().RivalsV65 = { switch = true }
 local SWITCH_DIMS = { hitpart = true, origin = true, point = true, direct = true }
 env.RivalsShotWindow = ShotWindow
 do
@@ -4226,6 +4257,22 @@ do
         local cycle = ShotWindow.RealCycle(controller)
         if cycle ~= cycle then cycle = 0 end
         return math.clamp(cycle + LINGER_EXTRA, LINGER_MIN, LINGER_MAX)
+    end
+
+    -- a melee holder standing still behind a wall hit 32.7% from the 12-stud spots (1,056 windows in checkpoints
+    -- 75-76) against 68.4% for a moving one: on a still one the tuner also tries the arm's own spots ('near') and keeps
+    -- score. Returns whether the melee spots are used, and the choice when it was the tuner's
+    function WallbangController:MeleeSpots(target)
+        if not env.RivalsTargetState:HoldsMelee(target) then return false, nil end
+        local character = target.Character
+        local root = character and character:FindFirstChild('HumanoidRootPart')
+        if not root or not v65('meleeStill') or root.AssemblyLinearVelocity.Magnitude >= STILL_SPEED then return true, nil end
+        local tuner = env.RivalsTuner
+        if tuner.meleeStillCharacter ~= character then
+            tuner.meleeStillCharacter = character
+            tuner.meleeStillArm = tuner:Choose('meleeStill')
+        end
+        return tuner.meleeStillArm ~= 'near', tuner.meleeStillArm
     end
 
     function WallbangController:ArmFor(target)
@@ -4389,14 +4436,16 @@ do
         local desyncArm = (visible and reachArm ~= 'move' and not escape and not shieldSide and not warmReuse) and 'none' or self:ArmFor(targetPlayer)
         DesyncController.avoidBlock = (rage and v65('shieldMove')) and targetPlayer or nil
         DesyncController.blockWeapon = weaponName
-        local meleeSafe = false
+        local meleeSafe, meleeStillArm = false, nil
         local warmed = nil
         if desyncArm == 'none' then
             if DesyncController.active then
                 DesyncController:Stop('visible')
             end
         else
-            meleeSafe = env.RivalsTargetState:HoldsMelee(targetPlayer)
+            meleeSafe, meleeStillArm = self:MeleeSpots(targetPlayer)
+            -- running from a melee holder in reach always takes the far spots
+            if escape then meleeSafe, meleeStillArm = true, nil end
             local spots = DESYNC_CANDIDATES[meleeSafe and 'melee' or desyncArm]
             if DesyncController.offsets ~= spots then
                 DesyncController.pick = nil
@@ -4423,8 +4472,10 @@ do
             -- before then, and its first windows held so hit 67.5% behind walls and 84% in sight in checkpoint 72 (the
             -- Sniper 70% against 45% cold). A fast gun waits only FAST_WARM: its first window behind a wall hit 22% when
             -- it went out about 0.09s after the body was placed (checkpoint 75). An escape cannot wait
+            -- a fast gun fired by hand keeps sending requests while this waits (checkpoint 76: windows sent
+            -- together rose from 206 to 405), so it only waits when the autofire holds its presses for it
             local warmFor = slowGun and WARM_UP or FAST_WARM
-            if not escape and v65('hookWarm') then
+            if not escape and v65('hookWarm') and (slowGun or on('autoFire')) then
                 local began = os.clock()
                 local waited = nil
                 while DesyncController.active and os.clock() - began < warmFor do
@@ -4495,7 +4546,7 @@ do
         end
         if window.switchFrom == nil then
             window.switchFrom = false
-            local from = v65('switch') and env.RivalsStats:MissRun(targetPlayer) or nil
+            local from = V65.switch == true and env.RivalsStats:MissRun(targetPlayer) or nil
             if from then
                 window.switchTried = true
                 if env.RivalsTuner.random() < 0.5 then window.switchFrom = from end
@@ -4644,6 +4695,9 @@ do
                 if reachDim then arms[reachDim] = nil end
             end
         end
+        if meleeStillArm and desyncArm ~= 'none' then
+            arms.meleeStill = meleeStillArm
+        end
         if meleeSafe then
             -- the melee holder's spot list stood in for the desync arm's own spots
             arms.desync = nil
@@ -4757,7 +4811,7 @@ do
         if self.pressFrom and now - self.pressFrom > cycle + PREWARM_DRY then return press() end
         local desync = DesyncController
         if not desync.active or desync.startTarget ~= target then
-            local list = env.RivalsTargetState:HoldsMelee(target) and 'melee' or self:ArmFor(target)
+            local list = self:MeleeSpots(target) and 'melee' or self:ArmFor(target)
             local spots = DESYNC_CANDIDATES[list]
             if not spots then return press() end
             desync.offsets, desync.fallback, desync.offset = spots, DESYNC_FALLBACK[list], spots[1]
