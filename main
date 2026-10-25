@@ -121,7 +121,8 @@ local function showSplash()
 end
 
 local BOOT_CHECK_AFTER = 8
-local BOOT_RECHECK_AFTER = 20
+-- long enough for a section waiting on the game's modules (GAME_MODULE_WAIT, plus a require given up on) to finish
+local BOOT_RECHECK_AFTER = 45
 
 local function clip(text, count)
 	local ok, cut = pcall(function()
@@ -132,14 +133,131 @@ local function clip(text, count)
 	return ok and cut or string.sub(text, 1, count)
 end
 
+-- the game's own modules are required only once the game has loaded them itself (getloadedmodules), or after
+-- GAME_MODULE_WAIT. Every batch since checkpoint 75 had 10-40 start reports with the game's modules erroring when
+-- required ('Requested module experienced an error while loading') or sections that never finished, which is what a
+-- module first run by this script, before the game's client is up, does: it breaks for the game too. A require that
+-- does not return within GAME_REQUIRE_HANG is given up on instead of holding its section forever
+local GAME_MODULE_WAIT = 30
+local GAME_REQUIRE_HANG = 20
+local GameModules = { waits = {}, deadline = nil, startedAt = nil, readyAt = nil }
+pcall(function() GameModules.startedAt = workspace.DistributedGameTime end)
+
+local function loadedByGame(module)
+	if type(getloadedmodules) ~= "function" then return nil end
+	local ok, list = pcall(getloadedmodules)
+	if not ok or type(list) ~= "table" then return nil end
+	for _, loaded in ipairs(list) do
+		if loaded == module then return true end
+	end
+	-- a cloned reference does not compare equal to the game's own
+	local okPath, path = pcall(function() return module:GetFullName() end)
+	if not okPath then return false end
+	for _, loaded in ipairs(list) do
+		local okOther, other = pcall(function() return loaded:GetFullName() end)
+		if okOther then
+			if other == path then return true end
+			-- the list shows the game's own modules at all (some executors list only their own)
+			if not GameModules.listsGame and (string.find(other, "PlayerScripts", 1, true) or string.sub(other, 1, 18) == "ReplicatedStorage.") then
+				GameModules.listsGame = true
+			end
+		end
+	end
+	return false
+end
+
+local function requireGame(module)
+	if typeof(module) ~= "Instance" then error("모듈을 못 찾음", 2) end
+	GameModules.deadline = GameModules.deadline or os.clock() + GAME_MODULE_WAIT
+	local began = os.clock()
+	local seen = loadedByGame(module)
+	while seen == false and os.clock() < GameModules.deadline do
+		-- a list that has shown none of the game's modules for 5s is no guide: require as before
+		if not GameModules.listsGame and os.clock() - began > 5 then
+			seen = nil
+			break
+		end
+		task.wait(0.5)
+		seen = loadedByGame(module)
+	end
+	local entry = { name = module.Name, waited = os.clock() - began, seen = seen }
+	table.insert(GameModules.waits, entry)
+	local finished, ok, result = false, false, nil
+	task.spawn(function()
+		ok, result = pcall(function() return require(module) end)
+		finished = true
+	end)
+	local start = os.clock()
+	while not finished and os.clock() - start < GAME_REQUIRE_HANG do
+		task.wait(0.1)
+	end
+	if not finished then
+		entry.hung = true
+		error(module.Name .. " require가 " .. GAME_REQUIRE_HANG .. "초 안에 안 끝남", 0)
+	end
+	if not ok then
+		entry.error = tostring(result)
+		error(result, 0)
+	end
+	return result
+end
+
+-- what the start report adds when something broke: the executor, how long after joining the script started, which
+-- game modules it waited for, and the errors the game itself printed (the real cause behind 'Requested module ...')
+local function bootDetails()
+	local lines = {}
+	local executor = "?"
+	pcall(function()
+		if type(identifyexecutor) == "function" then executor = table.concat({ identifyexecutor() }, " ") end
+	end)
+	local count = "없음"
+	if type(getloadedmodules) == "function" then
+		local ok, list = pcall(getloadedmodules)
+		count = ok and type(list) == "table" and tostring(#list) .. "개" or "실패"
+	end
+	table.insert(lines, string.format("환경: 실행기 %s, 접속 %s초 뒤 시작, 게임 대기 끝 %s초, 로드된 모듈 목록 %s", executor,
+		GameModules.startedAt and string.format("%.0f", GameModules.startedAt) or "?",
+		GameModules.readyAt and string.format("%.0f", GameModules.readyAt) or "?", count))
+	local waits = {}
+	for _, entry in ipairs(GameModules.waits) do
+		if entry.waited > 0.5 or entry.seen == false or entry.hung or entry.error then
+			table.insert(waits, string.format("%s %.1f초%s%s", entry.name, entry.waited,
+				entry.seen == false and "(게임 미로드)" or "", entry.hung and "(멈춤)" or entry.error and "(오류)" or ""))
+		end
+	end
+	if #waits > 0 then table.insert(lines, "모듈 대기: " .. table.concat(waits, ", ")) end
+	pcall(function()
+		local history = game:GetService("LogService"):GetLogHistory()
+		local seen, picked = {}, {}
+		for index = #history, 1, -1 do
+			local entry = history[index]
+			if entry.messageType == Enum.MessageType.MessageError then
+				local text = clip(tostring(entry.message), 220)
+				if not seen[text] then
+					seen[text] = true
+					table.insert(picked, 1, text)
+					if #picked >= 4 then break end
+				end
+			end
+		end
+		for _, text in ipairs(picked) do
+			table.insert(lines, "게임 오류 출력: " .. text)
+		end
+	end)
+	return lines
+end
+
 -- the start check goes to the same webhook as the match records (only when something is wrong)
-local function sendBoot(version, problems)
+local function sendBoot(version, problems, details)
 	local env = getgenv()
 	local url = env.RivalsWebhookUrl
 	if type(url) ~= "string" or not url:find("^https://rivals%-batch%.justiceasra%.workers%.dev/?$") then return false end
 	local req = request or http_request or (syn and syn.request) or (http and http.request)
 	if type(req) ~= "function" then return false end
 	local text = "[" .. version .. "] 시작 점검 문제 " .. #problems .. "개\n" .. table.concat(problems, "\n")
+	if details and #details > 0 then
+		text = text .. "\n" .. table.concat(details, "\n")
+	end
 	local ok, payload = pcall(function()
 		return game:GetService("HttpService"):JSONEncode({ content = clip(text, 1800) })
 	end)
@@ -201,7 +319,8 @@ local function bootReport(boot, final)
 		warn("[rivals] 시작 점검: " .. line)
 	end
 	if #problems > 0 then
-		sendBoot(version, problems)
+		local ok, details = pcall(bootDetails)
+		sendBoot(version, problems, ok and details or nil)
 	end
 	return problems
 end
@@ -217,8 +336,12 @@ local function waitForGame()
 		task.wait(0.1)
 		player = Players.LocalPlayer
 	end
-	local scripts = player:WaitForChild("PlayerScripts", 30)
-	if scripts then scripts:WaitForChild("Controllers", 30) end
+	-- no time limit: start reports had 'Controllers is not a valid member of PlayerScripts' and 'Modules is not a
+	-- valid member of ReplicatedStorage' after the old 30s, and waiting longer costs nothing
+	local scripts = player:WaitForChild("PlayerScripts")
+	scripts:WaitForChild("Controllers")
+	scripts:WaitForChild("Modules")
+	game:GetService("ReplicatedStorage"):WaitForChild("Modules")
 	player:WaitForChild("PlayerGui", 30)
 	local began = os.clock()
 	while not player.Character and os.clock() - began < 20 do
@@ -226,6 +349,7 @@ local function waitForGame()
 	end
 	local character = player.Character
 	if character then character:WaitForChild("HumanoidRootPart", 10) end
+	pcall(function() GameModules.readyAt = workspace.DistributedGameTime end)
 end
 
 local runId = (getgenv().RivalsRunId or 0) + 1
@@ -318,11 +442,11 @@ local HttpService = game:GetService("HttpService")
 local player = Players.LocalPlayer
 local playerScripts = player.PlayerScripts
 local controllers = playerScripts.Controllers
-local EnumLibrary = require(ReplicatedStorage.Modules:WaitForChild("EnumLibrary", 10))
+local EnumLibrary = requireGame(ReplicatedStorage.Modules:WaitForChild("EnumLibrary", 10))
 if EnumLibrary then EnumLibrary:WaitForEnumBuilder() end
-local CosmeticLibrary = require(ReplicatedStorage.Modules:WaitForChild("CosmeticLibrary", 10))
-local ItemLibrary = require(ReplicatedStorage.Modules:WaitForChild("ItemLibrary", 10))
-local DataController = require(controllers:WaitForChild("PlayerDataController", 10))
+local CosmeticLibrary = requireGame(ReplicatedStorage.Modules:WaitForChild("CosmeticLibrary", 10))
+local ItemLibrary = requireGame(ReplicatedStorage.Modules:WaitForChild("ItemLibrary", 10))
+local DataController = requireGame(controllers:WaitForChild("PlayerDataController", 10))
 local equipped, favorites = {}, {}
 local constructingWeapon, viewingProfile = nil, nil
 local lastUsedWeapon = nil
@@ -454,7 +578,7 @@ DataController.GetWeaponData = function(self, weaponName)
 end
 
 local FighterController
-pcall(function() FighterController = require(controllers:WaitForChild("FighterController", 10)) end)
+pcall(function() FighterController = requireGame(controllers:WaitForChild("FighterController", 10)) end)
 
 if hookmetamethod then
     local remotes = ReplicatedStorage:FindFirstChild("Remotes")
@@ -521,7 +645,7 @@ if hookmetamethod then
 end
 
 local ClientItem
-pcall(function() ClientItem = require(player.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem) end)
+pcall(function() ClientItem = requireGame(player.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem) end)
 
 if ClientItem and ClientItem._CreateViewModel then
     local originalCreateViewModel = ClientItem._CreateViewModel
@@ -547,7 +671,7 @@ end
 
 local viewModelModule = player.PlayerScripts.Modules.ClientReplicatedClasses.ClientFighter.ClientItem:FindFirstChild("ClientViewModel")
 if viewModelModule then
-    local ClientViewModel = require(viewModelModule)
+    local ClientViewModel = requireGame(viewModelModule)
     local originalNew = ClientViewModel.new
     ClientViewModel.new = function(replicatedData, clientItem)
         local weaponPlayer = clientItem.ClientFighter and clientItem.ClientFighter.Player
@@ -699,7 +823,7 @@ if ClientItem and ClientItem._CreateViewModel then
 end
 
 if viewModelModule then
-    local ClientViewModel = require(viewModelModule)
+    local ClientViewModel = requireGame(viewModelModule)
     if ClientViewModel.GetCharm then
         local originalGetCharmFunc = ClientViewModel.GetCharm
         ClientViewModel.GetCharm = function(self)
@@ -821,7 +945,7 @@ end
 
 local EmoteController
 pcall(function()
-    EmoteController = require(controllers:WaitForChild("EmoteController", 10))
+    EmoteController = requireGame(controllers:WaitForChild("EmoteController", 10))
     if EmoteController and EmoteController.GetEmotes then
         local originalGetEmotes = EmoteController.GetEmotes
         EmoteController.GetEmotes = function(self)
@@ -966,7 +1090,7 @@ if ClientItem and ClientItem._CreateViewModel then
 end
 
 if viewModelModule then
-    local ClientViewModel = require(viewModelModule)
+    local ClientViewModel = requireGame(viewModelModule)
     if ClientViewModel.GetWrap then
         local originalGetWrapFunc = ClientViewModel.GetWrap
         ClientViewModel.GetWrap = function(self)
@@ -998,7 +1122,7 @@ if viewModelModule then
 end
 
 pcall(function()
-    local ViewProfile = require(player.PlayerScripts.Modules.Pages.ViewProfile)
+    local ViewProfile = requireGame(player.PlayerScripts.Modules.Pages.ViewProfile)
     if ViewProfile and ViewProfile.Fetch then
         local originalFetch = ViewProfile.Fetch
         ViewProfile.Fetch = function(self, targetPlayer)
@@ -1109,7 +1233,7 @@ end
 
 local function loadModule(name, getter)
     local ok, result = pcall(function()
-        return require(getter())
+        return requireGame(getter())
     end)
     if not ok or result == nil then
         note(name, false, ok and 'nil' or tostring(result))
@@ -1170,6 +1294,14 @@ local function setInfo(info, key, enabled, value)
     end
 end
 
+-- the RPG bursts where its rocket lands: at its own speed it hit 23.8% of moving targets against 41.7% sped up
+-- (checkpoints 72-79), unlike the bow, daggers and slingshot, which hit best at their own speed with the lead
+local function projectileArm(name)
+    local arm = env.RivalsStats and env.RivalsStats.projArm or nil
+    if arm == 'real' and name == 'RPG' then return 'fast' end
+    return arm
+end
+
 local inputWrapper = nil
 if originalInput then
     inputWrapper = function(self, ...)
@@ -1178,7 +1310,7 @@ if originalInput then
             pcall(function()
                 setInfo(info, "ShootRecoil", on("noRecoil"), 0)
                 setInfo(info, "ShootSpread", on("noSpread"), 0)
-                local arm = v65('projArm') and info.IsProjectile == true and env.RivalsStats and env.RivalsStats.projArm or nil
+                local arm = v65('projArm') and info.IsProjectile == true and projectileArm(self.Name) or nil
                 if arm == 'real' then
                     setInfo(info, "ProjectileSpeed", false, nil)
                 else
@@ -1264,7 +1396,16 @@ do
         if #Safety.deathLog > 10 then
             table.remove(Safety.deathLog, 1)
         end
-        event('죽음', string.format('%s, 디싱크 %.1fs 전, 회전 %.1fs 전, 방식 %s, 근접 위협 %.1fs 전', sudden and '급사' or '맞아서 사망', math.min(99, now - Safety.lastDesync), math.min(99, now - Safety.lastSpin), tostring(tuner and tuner.desyncArm or '-'), math.min(99, now - Safety.lastMelee)))
+        -- which way the current target was being shot (a warm spot next to it, or the camera): the warm spot puts the
+        -- body beside a target in sight, so deaths are compared by it as well
+        local sight = '-'
+        pcall(function()
+            local wallbang, controller = env.WallbangController, env.TargetController
+            local target = controller and controller.target
+            local sights = wallbang and wallbang.sights
+            if sights and target and target.Character then sight = sights[target.Character] or '-' end
+        end)
+        event('죽음', string.format('%s, 디싱크 %.1fs 전, 회전 %.1fs 전, 방식 %s, 근접 위협 %.1fs 전, 시야 %s', sudden and '급사' or '맞아서 사망', math.min(99, now - Safety.lastDesync), math.min(99, now - Safety.lastSpin), tostring(tuner and tuner.desyncArm or '-'), math.min(99, now - Safety.lastMelee), tostring(sight)))
         if now - Safety.lastDesync < DEATH_WINDOW and tuner and tuner.desyncArm then
             tuner:Penalize('desync', tuner.desyncArm, DEATH_PENALTY)
         end
@@ -1605,6 +1746,21 @@ do
         return state:Blocked(player, position + Vector3.new(0, 1.75, 0), self.blockWeapon) ~= nil
     end
 
+    -- with a riot shield up, a body at the holder's side hit 39-49% of 604 windows (checkpoints 75-79), in front of it
+    -- 2-6% and behind it 12-20%, and the melee spot list starts behind: while one is up, side spots come first
+    local SIDE_DOT = 0.38
+    local function shieldHolder(self)
+        local player = self.avoidBlock
+        local state = env.RivalsTargetState
+        if not player or not state or not state.ShieldUp or not v65('shieldSide') then return nil end
+        return state:ShieldUp(player, self.blockWeapon) and player or nil
+    end
+
+    local function atSide(player, position)
+        local dot = env.RivalsTargetState:LookDot(player, position)
+        return dot ~= nil and math.abs(dot) <= SIDE_DOT
+    end
+
     -- a target under a roof or in a corner left no listed spot safe: 12% of still windows (1.1% of moving ones) went
     -- out with the body unmoved and hit about 25%. The last try is the open air between the target and our own body
     local function approachList(targetRoot, rootPart)
@@ -1627,20 +1783,43 @@ do
     function DesyncController:Pick(targetRoot, head, rootPart)
         local now = os.clock()
         local cached = self.pick
+        local holder = shieldHolder(self)
         if cached and (cached.line or now - cached.at < 0.25) then
             local base = anchorFor(cached.list, targetRoot, head)
             local candidate = base and base * cached.offset
             if candidate then
                 local safe, exact = self:IsSafe(candidate.Position, rootPart)
-                if safe and (not cached.line or self:HasLine(candidate.Position, head)) and (cached.blocked or not blockedSpot(self, candidate.Position)) then
+                -- a side spot stops being one when the holder turns; a spot taken because no side one was free is
+                -- kept for its 0.25s, then the side ones are tried again
+                local sideOk = not holder or (cached.noSide and now - cached.at < 0.25) or atSide(holder, candidate.Position)
+                if safe and sideOk and (not cached.line or self:HasLine(candidate.Position, head)) and (cached.blocked or not blockedSpot(self, candidate.Position)) then
                     self.pickExact = exact == true
                     return candidate, cached.offset
                 end
             end
         end
+        local lists = { self.offsets or { self.offset or CFrame.new(0, 7, -2) }, self.fallback or {} }
+        if holder then
+            for _, list in ipairs(lists) do
+                local base = anchorFor(list, targetRoot, head)
+                if base then
+                    for _, offset in ipairs(list) do
+                        local candidate = base * offset
+                        if atSide(holder, candidate.Position) and not blockedSpot(self, candidate.Position) then
+                            local safe, exact = self:IsSafe(candidate.Position, rootPart)
+                            if safe and self:HasLine(candidate.Position, head) then
+                                self.pick = { offset = offset, list = list, line = head ~= nil, at = now }
+                                self.pickExact = exact == true
+                                return candidate, offset
+                            end
+                        end
+                    end
+                end
+            end
+        end
         local firstSafe, firstOffset, firstList, firstExact = nil, nil, nil, false
         local lastSafe, lastOffset, lastList, lastExact = nil, nil, nil, false
-        for _, list in ipairs({ self.offsets or { self.offset or CFrame.new(0, 7, -2) }, self.fallback or {} }) do
+        for _, list in ipairs(lists) do
             local base = anchorFor(list, targetRoot, head)
             if base then
                 for _, offset in ipairs(list) do
@@ -1652,7 +1831,7 @@ do
                                 lastSafe, lastOffset, lastList, lastExact = candidate, offset, list, exact == true
                             end
                         elseif self:HasLine(candidate.Position, head) then
-                            self.pick = { offset = offset, list = list, line = head ~= nil, at = now }
+                            self.pick = { offset = offset, list = list, line = head ~= nil, at = now, noSide = holder ~= nil or nil }
                             self.pickExact = exact == true
                             return candidate, offset
                         elseif not firstSafe then
@@ -1669,7 +1848,7 @@ do
                 local candidate = base * offset
                 local safe, exact = self:IsSafe(candidate.Position, rootPart)
                 if safe and not blockedSpot(self, candidate.Position) and self:HasLine(candidate.Position, head) then
-                    self.pick = { offset = offset, list = approach, line = head ~= nil, at = now }
+                    self.pick = { offset = offset, list = approach, line = head ~= nil, at = now, noSide = holder ~= nil or nil }
                     self.pickExact = exact == true
                     self.approached = (self.approached or 0) + 1
                     return candidate, offset
@@ -1677,12 +1856,12 @@ do
             end
         end
         if firstSafe then
-            self.pick = { offset = firstOffset, list = firstList, line = false, at = now }
+            self.pick = { offset = firstOffset, list = firstList, line = false, at = now, noSide = holder ~= nil or nil }
             self.pickExact = firstExact
             return firstSafe, firstOffset
         end
         if lastSafe then
-            self.pick = { offset = lastOffset, list = lastList, line = false, at = now, blocked = true }
+            self.pick = { offset = lastOffset, list = lastList, line = false, at = now, blocked = true, noSide = holder ~= nil or nil }
             self.pickExact = lastExact
             return lastSafe, lastOffset
         end
@@ -1878,7 +2057,7 @@ do
     local fighterController
     pcall(function()
         local module = PlayerScripts.Controllers:FindFirstChild('FighterController')
-        if module then fighterController = require(module) end
+        if module then fighterController = requireGame(module) end
     end)
     note('FighterController 모듈', fighterController ~= nil)
 
@@ -2024,6 +2203,11 @@ do
         if state.riotFront and not SHIELD_IMMUNE[weaponName] and dot < FRONT_BLOCK_DOT then return 'front' end
         if state.riotBack and not SHIELD_IMMUNE[weaponName] and dot > BACK_BLOCK_DOT then return 'back' end
         return nil
+    end
+
+    function TargetState:ShieldUp(player, weaponName)
+        local state = self:Read(player)
+        return state ~= nil and state.riotFront == true and not SHIELD_IMMUNE[weaponName]
     end
 
     function TargetState:LookDot(player, origin)
@@ -2419,8 +2603,8 @@ env.RivalsTuner = {
 do
     local Tuner = env.RivalsTuner
     local MIN_TRIALS = 5
-    -- the seeds come from the windows the tuner picked at random in checkpoints 75-76, where the choices differ by up
-    -- to 5 points (head hitbox centre 66.9% against 61-62%): trying less keeps more windows on the better choice
+    -- the seeds come from the windows the tuner picked at random in checkpoints 75-79, where the choices differ by up
+    -- to 5 points (head hitbox centre 66.9% against 62%): trying less keeps more windows on the better choice
     local EXPLORE = 0.05
     local EXPLORE_SURE = 0.02
     local SURE_AFTER = 15
@@ -2430,13 +2614,21 @@ do
     function Tuner:AddDimension(name, arms)
         local dim = { order = arms, arms = {} }
         for _, arm in ipairs(arms) do
-            dim.arms[arm] = { assigned = 0, finished = 0, hits = 0 }
+            dim.arms[arm] = { assigned = 0, finished = 0, hits = 0, pf = 0, ph = 0 }
         end
         self.dims[name] = dim
     end
 
+    -- finished/hits are this player's own windows (halved each time they are carried over, and when they pile up);
+    -- pf/ph are the seed, which stays: with the seed halved away along with them, a few misses in a row flipped the
+    -- best choice, and in checkpoint 79 the head hitbox centre (best in every weapon, range and ping in 4,778
+    -- windows picked at random) got 37% of windows against 53% in checkpoint 75
     local function score(arm)
-        return (arm.hits + 1) / (arm.finished + 2)
+        return (arm.hits + (arm.ph or 0) + 1) / (arm.finished + (arm.pf or 0) + 2)
+    end
+
+    local function known(arm)
+        return arm.finished + (arm.pf or 0)
     end
 
     function Tuner:BestOther(name, weapon, exclude)
@@ -2475,14 +2667,14 @@ do
         local mode = 'trial'
         for _, arm in ipairs(dim.order) do
             local assigned = dim.arms[arm].assigned
-            if assigned < MIN_TRIALS and assigned < fewest and dim.arms[arm].finished < 3 * MIN_TRIALS then
+            if assigned < MIN_TRIALS and assigned < fewest and known(dim.arms[arm]) < 3 * MIN_TRIALS then
                 pick, fewest = arm, assigned
             end
         end
         if not pick then
             local best = self:Best(name)
             local explore = EXPLORE
-            if dim.arms[best].finished >= SURE_AFTER then
+            if known(dim.arms[best]) >= SURE_AFTER then
                 local rival = 0
                 for _, armName in ipairs(dim.order) do
                     if armName ~= best then
@@ -2511,7 +2703,7 @@ do
         if not dim then return false end
         local finished = 0
         for _, arm in pairs(dim.arms) do
-            finished += arm.finished
+            finished += known(arm)
         end
         if finished < 20 or score(dim.arms[self:Best(name)]) >= 0.12 then
             return true
@@ -2567,154 +2759,168 @@ do
     Tuner:AddDimension('flankReach', { 'near', 'mid', 'far' })
     Tuner:AddDimension('meleeStill', { 'far', 'near' })
 
-    -- each weapon's own start, from the fire-window tables of checkpoint 64's 1333 matches: per window, credited like
-    -- the tuner credits (damage squared). Left out: windows whose body never moved, invincible targets, shield-blocked
-    -- shots, and shots fired in a desync's first 0.25s (they hit 42% where the same arms hit 66-73% later, and
-    -- checkpoint 71 waits that time out), which had made moving the body and the 'shooter' origin look worse than they are
+    -- each weapon's own start, from the windows of checkpoints 75, 76 and 79 where the tuner picked that choice at
+    -- random (best-choice windows come from players whose tuners already lean one way), credited like the tuner credits
+    -- (damage squared). Left out: windows whose body never moved, invincible targets and shield-blocked shots. '@*' is
+    -- all weapons together, for a weapon without enough windows of its own
     local SEEDS = {
-        ["desync@Assault Rifle"] = { above = { 1157.5, 3631 }, glue = { 967.3, 3215 } },
-        ["desync@Bow"] = { above = { 3.1, 79 }, glue = { 1.2, 42 } },
-        ["desync@Burst Rifle"] = { above = { 33, 85 }, glue = { 24.4, 66 } },
-        ["desync@Crossbow"] = { above = { 26.4, 56 }, glue = { 16.5, 26 } },
-        ["desync@Daggers"] = { above = { 13.7, 91 }, glue = { 4.9, 53 } },
+        ["desync@Assault Rifle"] = { above = { 1262.8, 3977 }, glue = { 1040.9, 3471 } },
+        ["desync@Bow"] = { above = { 5.1, 93 }, glue = { 1.8, 58 } },
+        ["desync@Burst Rifle"] = { above = { 33.3, 87 }, glue = { 24.6, 66 } },
+        ["desync@Crossbow"] = { above = { 26.9, 58 }, glue = { 17.3, 27 } },
+        ["desync@Daggers"] = { above = { 15.1, 106 }, glue = { 5.2, 59 } },
         ["desync@Energy Pistols"] = { above = { 14.5, 80 }, glue = { 31.6, 122 } },
-        ["desync@Handgun"] = { above = { 92.6, 291 }, glue = { 93.3, 325 } },
-        ["desync@RPG"] = { above = { 14.4, 60 }, glue = { 8, 30 } },
-        ["desync@Revolver"] = { above = { 10.5, 51 }, glue = { 3.7, 23 } },
-        ["desync@Shotgun"] = { above = { 123.5, 296 }, glue = { 109.5, 320 } },
-        ["desync@Slingshot"] = { above = { 10.4, 58 } },
-        ["desync@Sniper"] = { above = { 75.4, 156 }, glue = { 55.8, 134 } },
-        ["desync@Spray"] = { above = { 58.2, 196 }, glue = { 74.3, 223 } },
-        ["desync@Uzi"] = { above = { 85.6, 353 }, glue = { 95.7, 348 } },
-        ["desync@Wildcat"] = { above = { 196.8, 861 }, glue = { 137.2, 572 } },
-        ["direct@Assault Rifle"] = { near = { 152.9, 662 }, camera = { 142.2, 692 } },
-        ["direct@Bow"] = { near = { 0.2, 15 }, camera = { 3.4, 15 } },
-        ["direct@Burst Rifle"] = { near = { 9.4, 33 }, camera = { 13.9, 41 } },
+        ["desync@Handgun"] = { above = { 115.7, 342 }, glue = { 101.2, 360 } },
+        ["desync@RPG"] = { above = { 15.4, 63 }, glue = { 8, 31 } },
+        ["desync@Revolver"] = { above = { 13, 58 }, glue = { 3.7, 23 } },
+        ["desync@Shotgun"] = { above = { 125.7, 300 }, glue = { 112.6, 327 } },
+        ["desync@Slingshot"] = { above = { 10.4, 58 }, glue = { 1.4, 26 } },
+        ["desync@Sniper"] = { above = { 87.6, 184 }, glue = { 64, 146 } },
+        ["desync@Spray"] = { above = { 76.7, 250 }, glue = { 102.7, 300 } },
+        ["desync@Uzi"] = { above = { 86.9, 362 }, glue = { 95.7, 348 } },
+        ["desync@Wildcat"] = { above = { 185.3, 893 }, glue = { 122.6, 572 } },
+        ["direct@Assault Rifle"] = { near = { 176.3, 735 }, camera = { 159.5, 758 } },
+        ["direct@Bow"] = { near = { 0.2, 23 }, camera = { 3.4, 20 } },
+        ["direct@Burst Rifle"] = { near = { 12.1, 45 }, camera = { 18.9, 53 } },
         ["direct@Crossbow"] = { near = { 23.1, 48 }, camera = { 15.5, 38 } },
         ["direct@Energy Pistols"] = { near = { 5.5, 30 }, camera = { 8.5, 44 } },
         ["direct@Exogun"] = { near = { 18.2, 34 }, camera = { 21.1, 31 } },
-        ["direct@Handgun"] = { near = { 21.4, 98 }, camera = { 22.9, 111 } },
+        ["direct@Handgun"] = { near = { 31.2, 134 }, camera = { 30.4, 138 } },
         ["direct@Permafrost"] = { near = { 12.9, 36 }, camera = { 10.2, 32 } },
-        ["direct@Revolver"] = { near = { 16.8, 93 }, camera = { 9.3, 74 } },
-        ["direct@Shotgun"] = { near = { 34.3, 171 }, camera = { 30.2, 151 } },
-        ["direct@Slingshot"] = { near = { 0.3, 22 }, camera = { 1.4, 17 } },
-        ["direct@Sniper"] = { near = { 91.7, 251 }, camera = { 66.3, 209 } },
-        ["direct@Spray"] = { near = { 38.9, 154 }, camera = { 35.5, 141 } },
-        ["direct@Uzi"] = { near = { 27, 131 }, camera = { 26, 138 } },
-        ["direct@Wildcat"] = { near = { 107.2, 433 }, camera = { 92.9, 420 } },
-        ["facing@Assault Rifle"] = { look = { 366.1, 1325 }, old = { 363.5, 1347 } },
-        ["facing@Bow"] = { look = { 7.7, 79 } },
-        ["facing@Burst Rifle"] = { look = { 25.6, 87 }, old = { 19.8, 82 } },
+        ["direct@Revolver"] = { near = { 17.7, 98 }, camera = { 10.6, 79 } },
+        ["direct@Shotgun"] = { near = { 37.6, 181 }, camera = { 31.3, 157 } },
+        ["direct@Slingshot"] = { near = { 0.3, 25 }, camera = { 1.5, 20 } },
+        ["direct@Sniper"] = { near = { 101.1, 283 }, camera = { 73.7, 235 } },
+        ["direct@Spray"] = { near = { 42.7, 170 }, camera = { 38, 157 } },
+        ["direct@Uzi"] = { near = { 29.7, 142 }, camera = { 30.2, 147 } },
+        ["direct@Wildcat"] = { near = { 103.5, 457 }, camera = { 91.9, 443 } },
+        ["facing@*"] = { look = { 1279.1, 4769 }, old = { 1153.8, 4185 } },
+        ["facing@Assault Rifle"] = { look = { 389.9, 1408 }, old = { 387.6, 1434 } },
+        ["facing@Bow"] = { look = { 10.4, 140 } },
+        ["facing@Burst Rifle"] = { look = { 28.5, 99 }, old = { 24.5, 93 } },
         ["facing@Crossbow"] = { look = { 31.7, 68 }, old = { 33.9, 64 } },
-        ["facing@Daggers"] = { look = { 12.8, 93 } },
+        ["facing@Daggers"] = { look = { 15.5, 140 } },
         ["facing@Energy Pistols"] = { look = { 13.1, 54 }, old = { 9.1, 58 } },
         ["facing@Exogun"] = { look = { 22.7, 39 }, old = { 24.8, 34 } },
-        ["facing@Handgun"] = { look = { 57.2, 242 }, old = { 62.8, 238 } },
+        ["facing@Handgun"] = { look = { 75.9, 292 }, old = { 79.2, 290 } },
         ["facing@Permafrost"] = { look = { 11.6, 31 }, old = { 11.9, 34 } },
-        ["facing@RPG"] = { look = { 13.8, 57 } },
-        ["facing@Revolver"] = { look = { 28.2, 153 }, old = { 25.5, 144 } },
-        ["facing@Shotgun"] = { look = { 122.1, 391 }, old = { 96.8, 377 } },
-        ["facing@Slingshot"] = { look = { 2.7, 45 } },
-        ["facing@Sniper"] = { look = { 185.3, 455 }, old = { 146.1, 383 } },
-        ["facing@Spray"] = { look = { 81.8, 307 }, old = { 88.7, 304 } },
-        ["facing@Uzi"] = { look = { 50.9, 253 }, old = { 49.2, 241 } },
-        ["facing@Wildcat"] = { look = { 123.7, 524 }, old = { 116.3, 500 } },
-        ["hitpart@Assault Rifle"] = { hitbox = { 236.1, 962 }, head = { 224.6, 873 }, box = { 240.8, 828 } },
-        ["hitpart@Assault Rifle#crouch"] = { hitbox = { 23.4, 130 }, head = { 19.7, 112 }, box = { 11.9, 79 } },
-        ["hitpart@Assault Rifle#still"] = { hitbox = { 108.9, 569 }, head = { 82.9, 493 }, box = { 116.1, 532 } },
-        ["hitpart@Bow"] = { hitbox = { 3.5, 40 }, head = { 4.5, 69 }, box = { 1, 31 } },
-        ["hitpart@Burst Rifle"] = { hitbox = { 14.8, 61 }, head = { 15, 63 }, box = { 21.4, 59 } },
+        ["facing@RPG"] = { look = { 14.8, 62 } },
+        ["facing@Revolver"] = { look = { 28.9, 157 }, old = { 26.9, 149 } },
+        ["facing@Shotgun"] = { look = { 124.6, 400 }, old = { 102.4, 389 } },
+        ["facing@Slingshot"] = { look = { 2.8, 54 } },
+        ["facing@Sniper"] = { look = { 195.9, 486 }, old = { 154.7, 414 } },
+        ["facing@Spray"] = { look = { 99.4, 361 }, old = { 108.6, 365 } },
+        ["facing@Uzi"] = { look = { 54.1, 264 }, old = { 54, 252 } },
+        ["facing@Wildcat"] = { look = { 115.9, 549 }, old = { 114.7, 526 } },
+        ["hitpart@*"] = { hitbox = { 948.8, 3600 }, head = { 900.5, 3459 }, box = { 959, 3250 } },
+        ["hitpart@*#crouch"] = { hitbox = { 93, 417 }, head = { 66.3, 324 }, box = { 46.7, 228 } },
+        ["hitpart@*#still"] = { hitbox = { 294.9, 1413 }, head = { 205.7, 1186 }, box = { 288, 1300 } },
+        ["hitpart@Assault Rifle"] = { hitbox = { 263.5, 1056 }, head = { 255.4, 964 }, box = { 264.5, 898 } },
+        ["hitpart@Assault Rifle#crouch"] = { hitbox = { 26, 141 }, head = { 24.7, 122 }, box = { 14.5, 88 } },
+        ["hitpart@Assault Rifle#still"] = { hitbox = { 123, 647 }, head = { 99.7, 565 }, box = { 129.8, 590 } },
+        ["hitpart@Bow"] = { hitbox = { 4.8, 66 }, head = { 5.5, 93 }, box = { 2.2, 52 } },
+        ["hitpart@Burst Rifle"] = { hitbox = { 17, 71 }, head = { 18.6, 72 }, box = { 23.3, 64 } },
         ["hitpart@Crossbow"] = { hitbox = { 33.2, 60 }, head = { 28.5, 49 }, box = { 33.6, 51 } },
         ["hitpart@Crossbow#still"] = { hitbox = { 9.2, 25 }, head = { 4.5, 22 }, box = { 3.1, 7 } },
-        ["hitpart@Daggers"] = { hitbox = { 1.6, 39 }, head = { 3.2, 57 }, box = { 1.2, 42 } },
+        ["hitpart@Daggers"] = { hitbox = { 3.6, 61 }, head = { 4.1, 73 }, box = { 1.6, 57 } },
         ["hitpart@Energy Pistols"] = { hitbox = { 4.9, 29 }, head = { 7.5, 44 }, box = { 6.1, 33 } },
         ["hitpart@Exogun"] = { hitbox = { 17, 31 }, head = { 21.1, 26 }, box = { 22.6, 30 } },
-        ["hitpart@Handgun"] = { hitbox = { 48, 183 }, head = { 55.7, 227 }, box = { 51.8, 189 } },
-        ["hitpart@Handgun#still"] = { hitbox = { 7.4, 39 }, head = { 8.1, 37 }, box = { 6.2, 37 } },
+        ["hitpart@Handgun"] = { hitbox = { 60.2, 217 }, head = { 69.2, 267 }, box = { 61.7, 225 } },
+        ["hitpart@Handgun#crouch"] = { hitbox = { 2.7, 16 }, head = { 3.1, 16 }, box = { 1.7, 10 } },
+        ["hitpart@Handgun#still"] = { hitbox = { 11.1, 47 }, head = { 9.5, 44 }, box = { 8.5, 43 } },
         ["hitpart@Permafrost"] = { hitbox = { 7.1, 24 }, head = { 8.5, 26 }, box = { 13.4, 25 } },
-        ["hitpart@RPG"] = { hitbox = { 4.3, 22 }, head = { 4.8, 32 }, box = { 5.8, 17 } },
-        ["hitpart@Revolver"] = { hitbox = { 19.4, 122 }, head = { 17.5, 101 }, box = { 23.7, 103 } },
+        ["hitpart@RPG"] = { hitbox = { 5.3, 24 }, head = { 4.8, 34 }, box = { 5.8, 17 } },
+        ["hitpart@Revolver"] = { hitbox = { 19.8, 125 }, head = { 17.9, 104 }, box = { 24, 105 } },
         ["hitpart@Revolver#still"] = { hitbox = { 2.3, 19 }, head = { 0.8, 20 }, box = { 2.2, 27 } },
-        ["hitpart@Shotgun"] = { hitbox = { 101.9, 331 }, head = { 82.4, 293 }, box = { 88.8, 282 } },
-        ["hitpart@Shotgun#crouch"] = { hitbox = { 16.2, 51 }, head = { 9.5, 34 }, box = { 6.5, 17 } },
-        ["hitpart@Shotgun#still"] = { hitbox = { 27.6, 135 }, head = { 15.4, 90 }, box = { 38, 139 } },
-        ["hitpart@Slingshot"] = { hitbox = { 0.6, 22 }, head = { 1.9, 22 }, box = { 0.4, 20 } },
-        ["hitpart@Sniper"] = { hitbox = { 133.3, 334 }, head = { 116.8, 284 }, box = { 139, 312 } },
-        ["hitpart@Sniper#crouch"] = { hitbox = { 10.3, 23 }, head = { 3.1, 15 } },
-        ["hitpart@Sniper#still"] = { hitbox = { 29.9, 92 }, head = { 9.3, 49 }, box = { 28, 86 } },
-        ["hitpart@Spray"] = { hitbox = { 69.6, 262 }, head = { 71.2, 260 }, box = { 70.6, 259 } },
-        ["hitpart@Spray#crouch"] = { hitbox = { 6.6, 43 }, head = { 1.9, 26 }, box = { 4, 25 } },
-        ["hitpart@Spray#still"] = { hitbox = { 21.2, 85 }, head = { 10.3, 70 }, box = { 19, 82 } },
-        ["hitpart@Uzi"] = { hitbox = { 33.8, 184 }, head = { 40.5, 187 }, box = { 43.8, 194 } },
+        ["hitpart@Shotgun"] = { hitbox = { 106.8, 343 }, head = { 85.3, 302 }, box = { 91.3, 291 } },
+        ["hitpart@Shotgun#crouch"] = { hitbox = { 16.3, 52 }, head = { 10.1, 35 }, box = { 6.5, 17 } },
+        ["hitpart@Shotgun#still"] = { hitbox = { 27.6, 136 }, head = { 17, 92 }, box = { 38, 139 } },
+        ["hitpart@Slingshot"] = { hitbox = { 0.6, 26 }, head = { 1.9, 23 }, box = { 0.4, 23 } },
+        ["hitpart@Sniper"] = { hitbox = { 146, 364 }, head = { 123.6, 314 }, box = { 144.6, 333 } },
+        ["hitpart@Sniper#crouch"] = { hitbox = { 10.7, 25 }, head = { 3.9, 16 }, box = { 3.2, 6 } },
+        ["hitpart@Sniper#still"] = { hitbox = { 32.7, 99 }, head = { 9.3, 50 }, box = { 28, 86 } },
+        ["hitpart@Spray"] = { hitbox = { 87.5, 323 }, head = { 91.1, 315 }, box = { 89.6, 309 } },
+        ["hitpart@Spray#crouch"] = { hitbox = { 8.4, 48 }, head = { 2.4, 27 }, box = { 4, 25 } },
+        ["hitpart@Spray#still"] = { hitbox = { 28.2, 105 }, head = { 13.6, 86 }, box = { 22, 93 } },
+        ["hitpart@Uzi"] = { hitbox = { 36.5, 190 }, head = { 41.9, 192 }, box = { 47.8, 201 } },
         ["hitpart@Uzi#crouch"] = { hitbox = { 2.1, 23 }, head = { 3.2, 24 }, box = { 1.2, 14 } },
-        ["hitpart@Uzi#still"] = { hitbox = { 9.9, 59 }, head = { 6.8, 52 }, box = { 9.5, 73 } },
-        ["hitpart@Wildcat"] = { hitbox = { 109, 464 }, head = { 90.9, 436 }, box = { 101.5, 425 } },
-        ["hitpart@Wildcat#crouch"] = { hitbox = { 16.9, 68 }, head = { 14.6, 55 }, box = { 12.1, 46 } },
-        ["hitpart@Wildcat#still"] = { hitbox = { 31.9, 190 }, head = { 27.8, 166 }, box = { 27.7, 172 } },
-        ["origin@Assault Rifle"] = { under = { 163.9, 591 }, shooter = { 162.3, 541 }, clear = { 151.5, 506 } },
-        ["origin@Bow"] = { under = { 0.8, 23 }, shooter = { 1.4, 17 }, clear = { 0.2, 26 } },
-        ["origin@Burst Rifle"] = { under = { 7.2, 25 }, shooter = { 7.3, 16 }, clear = { 7.4, 19 } },
+        ["hitpart@Uzi#still"] = { hitbox = { 11.4, 64 }, head = { 7.1, 57 }, box = { 10, 78 } },
+        ["hitpart@Wildcat"] = { hitbox = { 108.6, 492 }, head = { 89.2, 461 }, box = { 97.8, 449 } },
+        ["hitpart@Wildcat#crouch"] = { hitbox = { 19.5, 82 }, head = { 15.9, 67 }, box = { 14.2, 58 } },
+        ["hitpart@Wildcat#still"] = { hitbox = { 30.4, 198 }, head = { 26, 176 }, box = { 28.7, 180 } },
+        ["origin@*"] = { under = { 459.3, 1647 }, shooter = { 428, 1476 }, clear = { 411.9, 1391 } },
+        ["origin@Assault Rifle"] = { under = { 185.3, 666 }, shooter = { 190.1, 631 }, clear = { 177.3, 601 } },
+        ["origin@Bow"] = { under = { 1, 34 }, shooter = { 1.4, 26 }, clear = { 1.5, 34 } },
+        ["origin@Burst Rifle"] = { under = { 7.3, 25 }, shooter = { 7.3, 16 }, clear = { 7.5, 19 } },
         ["origin@Crossbow"] = { under = { 13.5, 23 }, shooter = { 12.8, 23 }, clear = { 8, 18 } },
-        ["origin@Daggers"] = { under = { 3.3, 29 }, shooter = { 2.7, 20 }, clear = { 2.5, 19 } },
+        ["origin@Daggers"] = { under = { 3.5, 34 }, shooter = { 2.9, 26 }, clear = { 2.5, 23 } },
         ["origin@Energy Pistols"] = { under = { 4.2, 14 }, shooter = { 2.5, 12 }, clear = { 1, 6 } },
-        ["origin@Handgun"] = { under = { 25.1, 97 }, shooter = { 26.8, 98 }, clear = { 30.3, 98 } },
-        ["origin@RPG"] = { under = { 3.1, 14 }, shooter = { 1.6, 11 }, clear = { 1.2, 5 } },
+        ["origin@Handgun"] = { under = { 30.1, 107 }, shooter = { 30.6, 106 }, clear = { 34, 106 } },
+        ["origin@RPG"] = { under = { 3.1, 15 }, shooter = { 1.6, 11 }, clear = { 1.2, 5 } },
         ["origin@Revolver"] = { under = { 4.2, 18 }, shooter = { 1.6, 11 }, clear = { 1.7, 7 } },
-        ["origin@Shotgun"] = { under = { 58.5, 161 }, shooter = { 47.8, 134 }, clear = { 45.5, 127 } },
-        ["origin@Sniper"] = { under = { 34.4, 87 }, shooter = { 32.4, 78 }, clear = { 24.8, 45 } },
-        ["origin@Spray"] = { under = { 26.8, 90 }, shooter = { 23.3, 78 }, clear = { 27.2, 86 } },
+        ["origin@Shotgun"] = { under = { 60.7, 164 }, shooter = { 49, 138 }, clear = { 47.3, 131 } },
+        ["origin@Slingshot"] = { under = { 1, 15 }, shooter = { 0.6, 11 }, clear = { 1.8, 11 } },
+        ["origin@Sniper"] = { under = { 35.5, 91 }, shooter = { 34.4, 80 }, clear = { 24.8, 45 } },
+        ["origin@Spray"] = { under = { 42.3, 134 }, shooter = { 36.6, 121 }, clear = { 41.2, 119 } },
         ["origin@Uzi"] = { under = { 22, 89 }, shooter = { 19, 82 }, clear = { 19.4, 87 } },
-        ["origin@Wildcat"] = { under = { 34.8, 177 }, shooter = { 30.4, 144 }, clear = { 39.1, 158 } },
-        ["point@Assault Rifle"] = { center = { 219.6, 743 }, lead = { 209, 839 }, split = { 234.2, 825 }, ahead = { 217.1, 824 } },
-        ["point@Assault Rifle#crouch"] = { center = { 16.7, 96 }, lead = { 17, 93 }, split = { 13.4, 77 }, ahead = { 10.4, 67 } },
-        ["point@Assault Rifle#still"] = { center = { 90.3, 477 }, lead = { 77, 476 }, split = { 85.1, 426 }, ahead = { 99.4, 414 } },
-        ["point@Bow"] = { center = { 2.2, 40 }, lead = { 1.8, 32 }, split = { 2.5, 40 }, ahead = { 2, 30 } },
-        ["point@Burst Rifle"] = { center = { 15.2, 53 }, lead = { 18.2, 52 }, split = { 15.3, 49 }, ahead = { 10.7, 47 } },
+        ["origin@Wildcat"] = { under = { 33.8, 183 }, shooter = { 29.1, 151 }, clear = { 35.4, 160 } },
+        ["point@*"] = { center = { 901.2, 3045 }, lead = { 812, 3046 }, split = { 794.3, 2909 }, ahead = { 769.4, 2878 } },
+        ["point@*#crouch"] = { center = { 76.7, 352 }, lead = { 56.6, 272 }, split = { 44.1, 217 }, ahead = { 36.9, 184 } },
+        ["point@*#still"] = { center = { 236, 1266 }, lead = { 188.3, 1114 }, split = { 213.5, 944 }, ahead = { 217.1, 878 } },
+        ["point@Assault Rifle"] = { center = { 249.8, 833 }, lead = { 247.6, 963 }, split = { 264.6, 919 }, ahead = { 253.8, 929 } },
+        ["point@Assault Rifle#crouch"] = { center = { 19.7, 106 }, lead = { 22.2, 102 }, split = { 15.5, 87 }, ahead = { 12.4, 74 } },
+        ["point@Assault Rifle#still"] = { center = { 101.7, 547 }, lead = { 86.9, 537 }, split = { 99.5, 474 }, ahead = { 112.8, 464 } },
+        ["point@Bow"] = { center = { 3.5, 64 }, lead = { 1.8, 54 }, split = { 2.8, 63 }, ahead = { 4.2, 47 } },
+        ["point@Burst Rifle"] = { center = { 16.4, 61 }, lead = { 21.5, 58 }, split = { 17, 54 }, ahead = { 12.3, 52 } },
         ["point@Crossbow"] = { center = { 30.8, 52 }, lead = { 23.7, 38 }, split = { 27.6, 47 }, ahead = { 25.9, 47 } },
         ["point@Crossbow#still"] = { center = { 3.3, 22 }, lead = { 3.1, 17 }, split = { 8, 14 }, ahead = { 4.3, 7 } },
-        ["point@Daggers"] = { center = { 1.7, 34 }, lead = { 1.4, 39 }, split = { 1.4, 31 }, ahead = { 0.9, 26 } },
+        ["point@Daggers"] = { center = { 3.3, 50 }, lead = { 2.1, 53 }, split = { 1.7, 46 }, ahead = { 1.6, 38 } },
         ["point@Energy Pistols"] = { center = { 9.7, 35 }, lead = { 2.9, 21 }, split = { 2.6, 23 }, ahead = { 5.3, 38 } },
         ["point@Exogun"] = { center = { 18.4, 27 }, lead = { 18.7, 25 }, split = { 15.5, 23 }, ahead = { 15.1, 24 } },
-        ["point@Handgun"] = { center = { 45.7, 166 }, lead = { 47.4, 183 }, split = { 39.7, 161 }, ahead = { 40.4, 157 } },
-        ["point@Handgun#still"] = { center = { 4.6, 27 }, lead = { 3.6, 21 }, split = { 7.4, 24 }, ahead = { 4.5, 24 } },
+        ["point@Handgun"] = { center = { 57, 199 }, lead = { 60, 221 }, split = { 47.5, 190 }, ahead = { 48.8, 186 } },
+        ["point@Handgun#crouch"] = { center = { 3.4, 13 }, lead = { 1.7, 10 }, split = { 1.2, 8 }, ahead = { 0.5, 7 } },
+        ["point@Handgun#still"] = { center = { 6.3, 34 }, lead = { 4.9, 27 }, split = { 9.6, 28 }, ahead = { 6.7, 29 } },
         ["point@Permafrost"] = { center = { 8.8, 21 }, lead = { 10.1, 29 }, split = { 12.7, 31 }, ahead = { 13.2, 28 } },
-        ["point@RPG"] = { center = { 3.8, 22 }, lead = { 3.8, 17 }, split = { 2, 12 }, ahead = { 4.6, 19 } },
-        ["point@Revolver"] = { center = { 17.6, 93 }, lead = { 18.3, 88 }, split = { 13.3, 79 }, ahead = { 11.8, 73 } },
+        ["point@RPG"] = { center = { 4.8, 24 }, lead = { 3.8, 19 }, split = { 2, 12 }, ahead = { 4.6, 19 } },
+        ["point@Revolver"] = { center = { 18.1, 96 }, lead = { 18.6, 90 }, split = { 13.7, 81 }, ahead = { 11.8, 74 } },
         ["point@Revolver#still"] = { center = { 2.3, 25 }, lead = { 1.3, 17 }, split = { 2, 17 }, ahead = { 1.1, 11 } },
-        ["point@Shotgun"] = { center = { 97.4, 293 }, lead = { 65.4, 269 }, split = { 73.4, 230 }, ahead = { 63.8, 236 } },
-        ["point@Shotgun#crouch"] = { center = { 10.4, 43 }, lead = { 8.6, 28 }, split = { 6, 16 }, ahead = { 6.1, 15 } },
-        ["point@Shotgun#still"] = { center = { 21.6, 127 }, lead = { 20.2, 98 }, split = { 17.9, 65 }, ahead = { 11.7, 52 } },
-        ["point@Slingshot"] = { center = { 1.4, 19 }, lead = { 0.2, 14 }, split = { 0.3, 20 }, ahead = { 0.1, 17 } },
-        ["point@Sniper"] = { center = { 137.6, 304 }, lead = { 111.7, 267 }, split = { 94.6, 240 }, ahead = { 82.1, 209 } },
-        ["point@Sniper#crouch"] = { center = { 11.1, 24 }, lead = { 2.2, 11 }, split = { 3.1, 6 } },
-        ["point@Sniper#still"] = { center = { 25, 93 }, lead = { 11.1, 50 }, split = { 12.4, 38 }, ahead = { 9.4, 27 } },
-        ["point@Spray"] = { center = { 59.4, 228 }, lead = { 65.1, 220 }, split = { 49.3, 205 }, ahead = { 56.6, 205 } },
-        ["point@Spray#crouch"] = { center = { 4.4, 34 }, lead = { 3.7, 24 }, split = { 3.5, 20 }, ahead = { 1.4, 17 } },
-        ["point@Spray#still"] = { center = { 15.5, 85 }, lead = { 10.7, 60 }, split = { 11.7, 51 }, ahead = { 15, 41 } },
-        ["point@Uzi"] = { center = { 32.4, 183 }, lead = { 34.9, 154 }, split = { 38.4, 171 }, ahead = { 41.8, 171 } },
+        ["point@Shotgun"] = { center = { 101.4, 303 }, lead = { 68.1, 277 }, split = { 76, 238 }, ahead = { 67, 244 } },
+        ["point@Shotgun#crouch"] = { center = { 10.5, 44 }, lead = { 9.1, 29 }, split = { 6, 16 }, ahead = { 6.1, 15 } },
+        ["point@Shotgun#still"] = { center = { 22.6, 129 }, lead = { 20.8, 99 }, split = { 17.9, 65 }, ahead = { 11.7, 52 } },
+        ["point@Slingshot"] = { center = { 1.4, 20 }, lead = { 0.2, 16 }, split = { 0.3, 21 }, ahead = { 0.1, 18 } },
+        ["point@Sniper"] = { center = { 147.7, 329 }, lead = { 118.6, 293 }, split = { 100.5, 259 }, ahead = { 86.5, 226 } },
+        ["point@Sniper#crouch"] = { center = { 11.5, 26 }, lead = { 2.2, 11 }, split = { 3.2, 7 }, ahead = { 1.3, 5 } },
+        ["point@Sniper#still"] = { center = { 26.8, 99 }, lead = { 12.1, 51 }, split = { 13.4, 39 }, ahead = { 10.4, 29 } },
+        ["point@Spray"] = { center = { 77.9, 277 }, lead = { 80.9, 271 }, split = { 66.1, 257 }, ahead = { 72.6, 252 } },
+        ["point@Spray#crouch"] = { center = { 6.2, 39 }, lead = { 3.7, 24 }, split = { 3.5, 20 }, ahead = { 1.4, 17 } },
+        ["point@Spray#still"] = { center = { 21.5, 103 }, lead = { 12.8, 75 }, split = { 13.9, 58 }, ahead = { 18, 48 } },
+        ["point@Uzi"] = { center = { 33.8, 187 }, lead = { 38.4, 160 }, split = { 41.4, 176 }, ahead = { 44.2, 176 } },
         ["point@Uzi#crouch"] = { center = { 3.4, 25 }, lead = { 1.5, 24 }, split = { 1.8, 16 }, ahead = { 0.6, 13 } },
-        ["point@Uzi#still"] = { center = { 10.1, 60 }, lead = { 7.7, 54 }, split = { 5.3, 41 }, ahead = { 8, 44 } },
-        ["point@Wildcat"] = { center = { 87.9, 345 }, lead = { 78.2, 352 }, split = { 78.6, 371 }, ahead = { 84.2, 378 } },
-        ["point@Wildcat#crouch"] = { center = { 16.9, 61 }, lead = { 9.7, 48 }, split = { 10.7, 44 }, ahead = { 10.3, 39 } },
-        ["point@Wildcat#still"] = { center = { 23.8, 170 }, lead = { 21.1, 148 }, split = { 31.3, 155 }, ahead = { 27.5, 143 } },
+        ["point@Uzi#still"] = { center = { 11.4, 66 }, lead = { 7.7, 59 }, split = { 6.3, 46 }, ahead = { 9, 49 } },
+        ["point@Wildcat"] = { center = { 88.8, 371 }, lead = { 78.1, 382 }, split = { 80.9, 397 }, ahead = { 84.8, 407 } },
+        ["point@Wildcat#crouch"] = { center = { 17.9, 73 }, lead = { 12, 57 }, split = { 11.1, 54 }, ahead = { 12.1, 46 } },
+        ["point@Wildcat#still"] = { center = { 22.8, 177 }, lead = { 20.3, 157 }, split = { 30.1, 160 }, ahead = { 28.9, 150 } },
         ["reach@Assault Rifle"] = { move = { 25.1, 158 }, stay = { 83.8, 302 } },
+        ["reach@Bow"] = { move = { 0, 12 }, stay = { 0.5, 20 } },
         ["reach@Crossbow"] = { move = { 15.5, 26 }, stay = { 15.3, 42 } },
         ["reach@Handgun"] = { move = { 6.7, 35 }, stay = { 10, 31 } },
         ["reach@Revolver"] = { move = { 3.5, 24 }, stay = { 2.6, 14 } },
-        ["reach@Shotgun"] = { move = { 17.5, 60 }, stay = { 11.8, 58 } },
-        ["reach@Sniper"] = { move = { 75.6, 148 }, stay = { 39.2, 96 } },
-        ["reach@Spray"] = { move = { 4.7, 43 }, stay = { 12.7, 56 } },
+        ["reach@Shotgun"] = { move = { 17.8, 61 }, stay = { 12.6, 60 } },
+        ["reach@Sniper"] = { move = { 77.1, 150 }, stay = { 39.2, 96 } },
+        ["reach@Spray"] = { move = { 5.3, 45 }, stay = { 13, 58 } },
         ["reach@Uzi"] = { move = { 3.7, 39 }, stay = { 13.4, 85 } },
-        ["reach@Wildcat"] = { move = { 13.2, 87 }, stay = { 36.8, 210 } },
+        ["reach@Wildcat"] = { move = { 11.5, 87 }, stay = { 33.6, 210 } },
         ["reachNear@Assault Rifle"] = { move = { 13.2, 92 }, stay = { 44.9, 158 } },
         ["reachNear@Revolver"] = { move = { 2.8, 32 }, stay = { 3.3, 14 } },
-        ["reachNear@Shotgun"] = { move = { 14.1, 56 }, stay = { 15, 54 } },
+        ["reachNear@Shotgun"] = { move = { 14.2, 57 }, stay = { 15.9, 56 } },
         ["reachNear@Sniper"] = { move = { 43.1, 93 }, stay = { 22, 47 } },
-        ["reachNear@Spray"] = { move = { 4.6, 28 }, stay = { 10.5, 31 } },
+        ["reachNear@Spray"] = { move = { 4.7, 29 }, stay = { 10.5, 31 } },
         ["reachNear@Uzi"] = { move = { 5.9, 40 }, stay = { 13.8, 71 } },
-        ["reachNear@Wildcat"] = { move = { 21, 91 }, stay = { 50.9, 246 } },
+        ["reachNear@Wildcat"] = { move = { 18.4, 91 }, stay = { 46, 246 } },
     }
-    local SEED_CAP = 150
+    -- a seed counts as up to SEED_CAP windows: a player's own (at most DECAY_AT, halved past that) move it only when
+    -- they keep disagreeing with it. A weapon without its own seed takes the one of all weapons ('@*')
+    local SEED_CAP = 600
     local PRIOR = 0.2
 
     function Tuner:Scoped(name, weapon)
@@ -2723,6 +2929,10 @@ do
         local base = self.dims[name]
         if not base then return name end
         local seed = SEEDS[key]
+        if not seed then
+            local ctx = string.match(weapon, '(#%a+)$') or ''
+            seed = SEEDS[name .. '@*' .. ctx]
+        end
         local total = 0
         if seed then
             for _, armName in ipairs(base.order) do
@@ -2733,10 +2943,14 @@ do
         local dim = { order = base.order, arms = {} }
         for _, armName in ipairs(base.order) do
             local global, mine = base.arms[armName], seed and seed[armName]
+            local pf = known(global) * PRIOR + (mine and mine[2] * scale or 0)
             dim.arms[armName] = {
-                assigned = MIN_TRIALS,
-                finished = global.finished * PRIOR + (mine and mine[2] * scale or 0),
-                hits = math.min(global.hits, global.finished) * PRIOR + (mine and mine[1] * scale or 0),
+                -- only a choice nothing is known about yet gets its few trials
+                assigned = pf >= 3 * MIN_TRIALS and MIN_TRIALS or 0,
+                finished = 0,
+                hits = 0,
+                pf = pf,
+                ph = math.min(global.hits + (global.ph or 0), known(global)) * PRIOR + (mine and mine[1] * scale or 0),
             }
         end
         self.dims[key] = dim
@@ -2744,7 +2958,11 @@ do
     end
 
     local FILE = 'rivals_tuner.json'
-    local VERSION = 8
+    -- 9: the file holds a player's own windows only (8 and before had the seed mixed in)
+    local VERSION = 9
+    -- a run started again in the same game carries the tuner over from memory (the table kept 6 since checkpoint 72,
+    -- so it always went back to the file instead)
+    Tuner.version = VERSION
 
     local function inherit(source)
         for name in pairs(source) do
@@ -2759,7 +2977,7 @@ do
                     if type(before) == 'table' and type(before.finished) == 'number' and type(before.hits) == 'number' and before.finished >= 0 then
                         arm.finished = before.finished * 0.5
                         arm.hits = math.min(before.hits, before.finished) * 0.5
-                        arm.assigned = math.min(MIN_TRIALS, math.floor(arm.finished))
+                        arm.assigned = math.min(MIN_TRIALS, math.floor(known(arm)))
                     end
                 end
             end
@@ -2810,7 +3028,7 @@ if env.RivalsStats and env.RivalsStats.connection then
 end
 env.RivalsStats = {
     nearArm = nil,
-    projArm = nil,
+    projArm = 'real',
     shots = 0,
     hits = 0,
     misses = 0,
@@ -2850,7 +3068,10 @@ do
     -- staying (68.5% against 67.2%) with 9% more damage (shots from above land on the head). Checkpoint 71 waits the
     -- warm-up out, so each match goes on picking one at random to settle it
     local NEAR_EXPERIMENT = true
-    local PROJ_EXPERIMENT = true
+    -- projectile speed arms (fast, mid, real) hit alike on still targets (43-48%), and on moving ones the shots aimed
+    -- with the ballistic lead, which only 'real' had (and the RPG), hit 27.6% against 17.2% (checkpoints 72-79): every
+    -- projectile weapon now keeps its own speed and gets the lead
+    local PROJ_EXPERIMENT = false
     local PROJ_ARMS = { 'fast', 'mid', 'real' }
     local INFO_KEYS = 60
     local INFO_WORDS = { 'projectile', 'gravity', 'speed', 'velocity', 'drop', 'drag', 'arc', 'charge', 'lifetime', 'range', 'travel', 'bullet', 'radius' }
@@ -2862,7 +3083,7 @@ do
     end
     local LOG_SIZE = 5000
     local CONSOLE_LINES = 30
-    local SCRIPT_CHECKPOINT = 79
+    local SCRIPT_CHECKPOINT = 81
     local SCRIPT_VERSION = '체크포인트 ' .. SCRIPT_CHECKPOINT
     env.RivalsVersion = SCRIPT_VERSION
 
@@ -3333,7 +3554,7 @@ do
             table.insert(lines, '실험: 가까운 적(50스터드 미만) 몸 ' .. (self.nearArm == 'move' and '옮김' or '안 옮김') .. ' (판마다 무작위)')
         end
         if self.projArm then
-            table.insert(lines, '실험: 투사체 무기 속도 ' .. self.projArm .. ' (판마다 무작위: fast=기본, mid=3000, real=원래 속도+탄도 조준)')
+            table.insert(lines, '투사체 무기 속도: ' .. self.projArm .. ' (real=원래 속도+탄도 조준, RPG는 빠르게)')
         end
         if self.weighedHits > 0 then
             table.insert(lines, string.format('최대 피해급 명중 %d/%d (머리 추정)', self.topHits, self.weighedHits))
@@ -3448,7 +3669,7 @@ do
                 local parts = {}
                 for _, arm in ipairs(dim.order) do
                     local a = dim.arms[arm]
-                    table.insert(parts, string.format('%s %.0f/%.0f', arm, a.hits, a.finished))
+                    table.insert(parts, string.format('%s %.0f/%.0f', arm, a.hits + (a.ph or 0), a.finished + (a.pf or 0)))
                 end
                 table.insert(lines, '튜너' .. (tuner.source and ('(' .. tuner.source .. '에서 이어받음)') or '') .. ' ' .. name .. ': ' .. table.concat(parts, '  ') .. '  -> ' .. tuner:Best(name))
             end
@@ -3735,6 +3956,7 @@ do
                 if info.block then table.insert(flags, 'block=' .. tostring(info.block)) end
                 if info.shield then table.insert(flags, 'shield=' .. tostring(info.shield)) end
                 if arms.meleeStill then table.insert(flags, 'meleeStill=' .. tostring(arms.meleeStill)) end
+                if info.sight then table.insert(flags, 'sight=' .. tostring(info.sight)) end
                 if info.moved == false then table.insert(flags, 'notMoved') end
                 local function arm(name) return arms[name] ~= nil and tostring(arms[name]) or '' end
                 local x = info.x or {}
@@ -3865,7 +4087,7 @@ do
         end
         self.log = {}
         self.nearArm = NEAR_EXPERIMENT and (math.random() < 0.5 and 'move' or 'stay') or nil
-        self.projArm = PROJ_EXPERIMENT and PROJ_ARMS[math.random(#PROJ_ARMS)] or nil
+        self.projArm = PROJ_EXPERIMENT and PROJ_ARMS[math.random(#PROJ_ARMS)] or 'real'
         table.clear(self.lateWatch)
         local antiAim = env.RivalsAntiAimStats
         if antiAim then
@@ -4246,6 +4468,25 @@ do
         return tuner.meleeStillArm ~= 'near', tuner.meleeStillArm
     end
 
+    -- a target in sight is shot from a warm desync spot next to it, or from the camera. Within the same engagements a
+    -- fast gun's windows from a warm spot hit 76.8% against 56.5% from the camera (310 engagements, checkpoints 75-79,
+    -- later windows alike: 75.9% against 58.4%), and for a fast gun a spot is warm 0.13s after the body was placed
+    -- (77% in sight from there), at every range (+14-22 points) and still or moving. Chosen once per target, 85% warm,
+    -- so the next data also shows what the wait at the start costs and whether the body beside a target dies more
+    local SIGHT_WARM = 0.85
+    function WallbangController:SightFor(target)
+        if not v65('sightWarm') then return 'camera' end
+        local character = target and target.Character
+        if not character then return 'camera' end
+        self.sights = self.sights or setmetatable({}, { __mode = 'k' })
+        local arm = self.sights[character]
+        if arm == nil then
+            arm = env.RivalsTuner.random() < SIGHT_WARM and 'warm' or 'camera'
+            self.sights[character] = arm
+        end
+        return arm
+    end
+
     function WallbangController:ArmFor(target)
         local tuner = env.RivalsTuner
         if tuner.desyncTarget ~= target or tuner.desyncCharacter ~= target.Character then
@@ -4402,8 +4643,12 @@ do
         -- 9-23% more damage, and 63% against 45% when only part of the head shows): keep it instead of dropping it
         local warmReuse = false
         local warmSince = DesyncController.placedAt
+        local sight = (rage and visible) and self:SightFor(targetPlayer) or nil
+        local warmNeed = (sight == 'warm' and not slowGun) and FAST_WARM or WARM_UP
+        -- a spot without a line to the head shoots a target in sight worse than the camera that sees it
+        local spotSees = DesyncController.pick ~= nil and DesyncController.pick.line == true
         if rage and visible and not escape and v65('warmReuse') and DesyncController.active and DesyncController.startTarget == targetPlayer
-            and DesyncController.placed ~= nil and warmSince ~= nil and os.clock() - warmSince >= WARM_UP then
+            and DesyncController.placed ~= nil and warmSince ~= nil and os.clock() - warmSince >= warmNeed and spotSees then
             warmReuse = true
         end
         local desyncArm = (visible and reachArm ~= 'move' and not escape and not shieldSide and not warmReuse) and 'none' or self:ArmFor(targetPlayer)
@@ -4524,7 +4769,10 @@ do
                 if env.RivalsTuner.random() < 0.5 then window.switchFrom = from end
             end
         end
-        local pointArm = choose('point')
+        -- a projectile with the ballistic lead aims at the centre: on moving targets the centre hit 31.2% against 18.1%
+        -- for 'ahead', whose own lead came on top of the ballistic one (checkpoints 72-79)
+        local pointForced = projectile and v65('ballistic') and v65('projectileCenter')
+        local pointArm = pointForced and 'center' or choose('point')
 
         local shieldMove = shieldSide ~= nil and desyncArm ~= 'none'
         warmReuse = warmReuse and desyncArm ~= 'none'
@@ -4608,7 +4856,7 @@ do
             hitPos, markPos = hitPos + scanApplied, markPos + scanApplied
         end
         local ballistic = nil
-        if v65('ballistic') and projectile and targetRoot and (weaponName == 'RPG' or env.RivalsStats.projArm == 'real') then
+        if v65('ballistic') and projectile and targetRoot then
             pcall(function()
                 local gun = controller.Info
                 local saved = savedInfo[gun]
@@ -4643,7 +4891,7 @@ do
             local pick = moved and DesyncController.pick or nil
             approached = (pick and pick.list and pick.list.anchor == 'flat') or nil
         end
-        local arms = { point = pointArm, facing = facingArm, hitpart = partArm }
+        local arms = { point = (not pointForced) and pointArm or nil, facing = facingArm, hitpart = partArm }
         if reachDim then
             arms[reachDim] = reachArm
         end
@@ -4682,7 +4930,7 @@ do
         local prewarmed = (desyncArm ~= 'none' and DesyncController.active and DesyncController.prewarmed) or nil
         local extra = nil
         if v65('log') then
-            extra = { pw = prewarmHeld, dh = hookWait, wu = warmed, fr = flankArm, pa = projectile and env.RivalsStats.projArm or nil, bl = ballistic and '1' or nil }
+            extra = { pw = prewarmHeld, dh = hookWait, wu = warmed, fr = flankArm, pa = projectile and projectileArm(weaponName) or nil, bl = ballistic and '1' or nil }
             if scanApplied then
                 extra.ox, extra.oy, extra.oz = scanApplied.X, scanApplied.Y, scanApplied.Z
             end
@@ -4710,7 +4958,7 @@ do
             end)
         end
         local weapon = type(controller) == 'table' and controller.Info or controller
-        env.RivalsStats:Record(targetPlayer, { arms = arms, moved = moved, exact = exact, direct = direct or nil, visible = visible or nil, retargeted = retargeted or nil, edge = edge or nil, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, silent = silent or nil, meleeSafe = meleeSafe or nil, escape = escape or nil, invincible = targetState:IsInvincible(targetPlayer) or nil, block = block, flank = flank, control = control, shield = shieldMove and shieldSide or nil, warm = warmReuse or nil, approach = approached or nil, prewarm = prewarmed, window = window, x = extra, scanned = scanApplied and true or nil })
+        env.RivalsStats:Record(targetPlayer, { arms = arms, moved = moved, exact = exact, direct = direct or nil, visible = visible or nil, retargeted = retargeted or nil, edge = edge or nil, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, silent = silent or nil, meleeSafe = meleeSafe or nil, escape = escape or nil, invincible = targetState:IsInvincible(targetPlayer) or nil, block = block, flank = flank, control = control, shield = shieldMove and shieldSide or nil, warm = warmReuse or nil, approach = approached or nil, prewarm = prewarmed, sight = sight, window = window, x = extra, scanned = scanApplied and true or nil })
 
         self:ArmCleanup((desyncArm ~= 'none' and v65('linger')) and lingerFor(controller) or nil)
     end
@@ -4734,11 +4982,12 @@ do
         env.RivalsStats:Record(targetPlayer, { direct = true, visible = true, silent = true, body = true, weapon = weapon, gun = type(weapon) == 'table' and weapon ~= controller and weapon or nil, weaponName = weaponName ~= nil and tostring(weaponName) or nil, window = window })
     end
 
-    -- the autofire asks this before it presses. At a target behind a wall the body goes to its desync spot first, and
-    -- the trigger stays up until the server has had time to see it there (WARM_UP for a slow gun, FAST_WARM for a fast
-    -- one): the shot then goes out at once from a warm spot instead of waiting in the hook. The spot is kept while the
-    -- gun cycles (a Sniper's 1.6s is longer than any linger, so each shot would start a cold one) until the trigger
-    -- has been down a while with no shot: a reload, when the body would only wait next to the target
+    -- the autofire asks this before it presses. At a target behind a wall, or one in sight given the warm spot, the
+    -- body goes to its desync spot first, and the trigger stays up until the server has had time to see it there
+    -- (WARM_UP for a slow gun, FAST_WARM for a fast one): the shot then goes out at once from a warm spot instead of
+    -- waiting in the hook, or from the camera. The spot is kept while the gun cycles (a Sniper's 1.6s is longer than
+    -- any linger, so each shot would start a cold one) until the trigger has been down a while with no shot: a
+    -- reload, when the body would only wait next to the target
     function WallbangController:Prewarm()
         if not self.active then return false end
         local now = os.clock()
@@ -4765,8 +5014,21 @@ do
         if not on('rage') or not v65('prewarm') then return press() end
         local target = TargetController.target
         local character = target and target.Character
-        if not character or not character:FindFirstChild('HumanoidRootPart') or TargetController.targetVisible ~= false or TargetController.targetInRange ~= true then
+        if not character or not character:FindFirstChild('HumanoidRootPart') or TargetController.targetInRange ~= true then
             return press()
+        end
+        local inSight = TargetController.targetVisible
+        if inSight ~= false then
+            -- in sight: only a target given the warm spot (SightFor), and not a melee holder in reach (the aim runs
+            -- from that one instead)
+            if inSight ~= true or self:SightFor(target) ~= 'warm' then return press() end
+            -- no spot could be placed for it a moment ago: the camera, rather than holding the trigger again
+            if self.noSpotCharacter == character and now < (self.noSpotUntil or 0) then return press() end
+            local head = character:FindFirstChild('Head')
+            local camera = currentCamera()
+            if env.RivalsTargetState:HoldsMelee(target) and head and camera and (head.Position - camera.CFrame.Position).Magnitude < MELEE_ESCAPE then
+                return press()
+            end
         end
         local item = env.RivalsTargetState:Equipped(LocalPlayer)
         local isGun, weaponName = false, nil
@@ -4798,7 +5060,16 @@ do
             self.desyncCleanup = nil
         end
         local placedAt = desync.placedAt
+        local seesHead = desync.pick ~= nil and desync.pick.line == true
+        if inSight and placedAt and not seesHead and now - placedAt >= 0.05 then
+            -- the only spot found has no line to the head: the aim shoots this one from the camera
+            self.noSpotCharacter, self.noSpotUntil = character, now + 3
+            return press()
+        end
         if now - (desync.startedAt or now) >= PREWARM_MAX or (placedAt and now - placedAt >= warmFor) then
+            if inSight and not placedAt then
+                self.noSpotCharacter, self.noSpotUntil = character, now + 3
+            end
             return press()
         end
         self.prewarmFrom = self.prewarmFrom or now
